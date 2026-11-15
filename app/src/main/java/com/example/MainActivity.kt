@@ -76,6 +76,7 @@ import com.example.noxer.ui.screens.CreateInstallScreen
 import com.example.noxer.ui.screens.CreateOfflineProfileScreen
 import com.example.noxer.ui.screens.HomeScreen
 import com.example.noxer.ui.screens.InstallationsScreen
+import com.example.noxer.ui.screens.JavaRuntimeManagerScreen
 import com.example.noxer.ui.screens.ModsScreen
 import com.example.noxer.ui.screens.SettingsScreen
 import com.example.noxer.ui.screens.VersionCenterScreen
@@ -98,6 +99,7 @@ import java.io.File
 @Serializable object ModsRoute
 @Serializable object ControlsRoute
 @Serializable object SettingsRoute
+@Serializable object RuntimeManagerRoute
 @Serializable object ConsoleRoute
 @Serializable data class CreateInstallRoute(
     val versionId: String,
@@ -351,6 +353,7 @@ fun NoxerAppShell(vm: NoxerViewModel = viewModel()) {
                                 onSelectInstallation = { vm.selectInstallation(it) },
                                 onOpenVersionCenter = { navigateTop(VersionsRoute) },
                                 onOpenAccounts = { navigateTop(AccountsRoute) },
+                                onOpenRuntimeManager = { navController.navigate(RuntimeManagerRoute) },
                                 onCancelDownload = { vm.cancelDownloads() },
                             )
                         }
@@ -535,9 +538,27 @@ fun NoxerAppShell(vm: NoxerViewModel = viewModel()) {
                                 onInstallRuntime = vm::installJavaRuntime,
                                 onVerifyRuntime = vm::verifyJavaRuntime,
                                 onDeleteRuntime = vm::deleteJavaRuntime,
+                                onOpenRuntimeManager = { navController.navigate(RuntimeManagerRoute) },
                                 onExportBackupSaf = vm::exportDirectoryToSaf,
                                 onRestoreBackupSaf = vm::restoreZipFromSaf,
                                 onRefreshDiagnostics = vm::refreshStorageAndDevices,
+                            )
+                        }
+
+                        composable<RuntimeManagerRoute> {
+                            JavaRuntimeManagerScreen(
+                                runtimes = runtimes,
+                                installProgress = runtimeProgress,
+                                abiInfo = vm.getRuntimeAbiInfo(),
+                                hostDiagnostics = vm.getRuntimeHostDiagnostics(),
+                                availableStorageBytes = vm.getRuntimeAvailableBytes(),
+                                onInstallJava = vm::installJavaRuntime,
+                                onCancelInstall = vm::cancelJavaRuntimeInstall,
+                                onUpdateRuntime = vm::updateJavaRuntime,
+                                onVerifyRuntime = vm::verifyJavaRuntime,
+                                onSetDefaultRuntime = vm::setDefaultJavaRuntime,
+                                onRemoveRuntime = vm::deleteJavaRuntime,
+                                onBack = { navController.popBackStack() },
                             )
                         }
 
@@ -558,6 +579,8 @@ fun NoxerAppShell(vm: NoxerViewModel = viewModel()) {
         LaunchStatusDialog(
             state = launchState,
             onDismiss = vm::dismissLaunchError,
+            onInstallJavaAndRetry = vm::installAndContinueLaunch,
+            onOpenRuntimeManager = { navController.navigate(RuntimeManagerRoute) },
         )
 
         browsingDir?.let { dir ->

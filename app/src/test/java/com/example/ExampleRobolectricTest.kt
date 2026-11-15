@@ -85,4 +85,23 @@ class ExampleRobolectricTest {
             .performScrollToNode(hasTestTag("account_dashboard_card"))
         composeRule.onAllNodesWithText("OFFLINE").onFirst().assertIsDisplayed()
     }
+
+    @Test
+    fun javaRuntimeManagerScreenRendersArchitectureAndInstallControls() {
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("nav_settings").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("open_runtime_manager_button").assertIsDisplayed().performClick()
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText("JAVA RUNTIME MANAGER").assertIsDisplayed()
+        composeRule.onNodeWithText("ANDROID DEVICE ARCHITECTURE").assertIsDisplayed()
+        composeRule.onNodeWithTag("runtime_manager_list")
+            .performScrollToNode(hasTestTag("install_java_primary_button"))
+        composeRule.onNodeWithTag("install_java_primary_button").assertIsDisplayed()
+        composeRule.onNodeWithTag("select_java_chip_21").assertIsDisplayed()
+        composeRule.onNodeWithTag("select_java_chip_17").assertIsDisplayed()
+        composeRule.onNodeWithTag("select_java_chip_8").assertIsDisplayed()
+        composeRule.onNodeWithTag("custom_java_version_input").assertIsDisplayed()
+    }
 }

@@ -23,6 +23,7 @@ import com.example.noxer.launch.CrashHandler
 import com.example.noxer.launch.GameLauncher
 import com.example.noxer.launch.LaunchErrorCategory
 import com.example.noxer.mods.ModLoaderManager
+import com.example.noxer.runtime.JavaRuntimeManager
 import com.example.noxer.settings.SettingsManager
 import com.example.noxer.version.OsRule
 import com.example.noxer.version.RuleEntry
@@ -281,11 +282,13 @@ class NoxerCoreTest {
         val sessionManager = AccountSessionManager(authManager, offlineManager, settingsManager, logger)
         val downloadEngine = DownloadEngine(okHttp, logger)
         val modLoaderManager = ModLoaderManager(okHttp, json, paths, downloadEngine, logger)
+        val runtimeManager = JavaRuntimeManager(okHttp, json, db.runtimeDao(), paths, logger)
         val launcher = GameLauncher(
             context = context,
             paths = paths,
             installationDao = db.installationDao(),
             runtimeDao = db.runtimeDao(),
+            runtimeManager = runtimeManager,
             authManager = authManager,
             offlineProfileManager = offlineManager,
             accountSessionManager = sessionManager,

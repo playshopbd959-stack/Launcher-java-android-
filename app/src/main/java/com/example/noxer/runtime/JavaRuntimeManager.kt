@@ -1,299 +1,588 @@
 package com.example.noxer.runtime
 
-import android.os.Build
+import android.os.StatFs
 import com.example.noxer.console.ConsoleLogger
 import com.example.noxer.core.NoxerPaths
+import com.example.noxer.data.db.InstallationDao
 import com.example.noxer.data.db.RuntimeDao
 import com.example.noxer.data.db.RuntimeEntity
 import com.example.noxer.download.DownloadEngine
 import com.example.noxer.nativebridge.NoxerNativeBridge
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
-import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
-import java.io.BufferedInputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 
-@Serializable
-private data class AdoptiumRelease(
-    @SerialName("release_name") val releaseName: String = "",
-    val binaries: List<AdoptiumBinary> = emptyList(),
-)
-
-@Serializable
-private data class AdoptiumBinary(
-    val architecture: String = "",
-    val os: String = "",
-    @SerialName("image_type") val imageType: String = "",
-    @SerialName("package") val pkg: AdoptiumPackage? = null,
-)
-
-@Serializable
-private data class AdoptiumPackage(
-    val name: String = "",
-    val link: String = "",
-    val checksum: String = "",
-    val size: Long = 0L,
-)
-
-data class RuntimeInstallProgress(
-    val isInstalling: Boolean = false,
-    val majorVersion: Int = 0,
-    val statusText: String = "",
-    val progressFraction: Float = 0f,
-)
-
-data class RuntimeDiagnostics(
-    val hostAbis: List<String>,
-    val primaryAbi: String,
-    val isArm64Host: Boolean,
-    val nativeBridgeLoaded: Boolean,
-    val eglReport: String,
-)
-
+/**
+ * Real Android-compatible Java Runtime Engine for NOXER LAUNCHER.
+ * Handles architecture/ABI detection, Android Bionic OpenJDK resolution (Java 8, 17, 21, 25+),
+ * resumable chunked downloads with SHA-256 verification, safe archive extraction, permission setup,
+ * real execution verification before registration, runtime coexistence, updates, and cleanup.
+ */
 class JavaRuntimeManager(
     private val okHttpClient: OkHttpClient,
     private val json: Json,
     private val runtimeDao: RuntimeDao,
     private val paths: NoxerPaths,
     private val consoleLogger: ConsoleLogger,
+    private val installationDao: InstallationDao? = null,
+    private val sourceResolver: RuntimeSourceResolver = AndroidRuntimeSourceResolver(okHttpClient, json),
+    private val executionProbe: RuntimeExecutionProbe = RuntimeExecutionProbe { libJvmPath, _ ->
+        NoxerNativeBridge.probeLibJvm(libJvmPath)
+    },
+    private val availableBytesProvider: () -> Long = {
+        runCatching {
+            paths.runtimesDir.mkdirs()
+            StatFs(paths.runtimesDir.absolutePath).availableBytes
+        }.getOrDefault(Long.MAX_VALUE)
+    },
 ) {
     val runtimes: Flow<List<RuntimeEntity>> = runtimeDao.observeAll()
+
+    private val verifier = AndroidRuntimeVerifier(executionProbe)
+    private val installMutex = Mutex()
+
+    @Volatile
+    private var cancelRequested = false
 
     private val _installProgress = MutableStateFlow(RuntimeInstallProgress())
     val installProgress: StateFlow<RuntimeInstallProgress> = _installProgress.asStateFlow()
 
+    fun detectAbiInfo(): AndroidAbiInfo = sourceResolver.detectAbiInfo()
+
     fun getHostDiagnostics(): RuntimeDiagnostics {
-        val abis = Build.SUPPORTED_ABIS?.toList().orEmpty().ifEmpty {
-            listOf(NoxerNativeBridge.getArchitecture())
-        }
-        val primary = abis.firstOrNull() ?: "unknown"
+        val abi = detectAbiInfo()
         return RuntimeDiagnostics(
-            hostAbis = abis,
-            primaryAbi = primary,
-            isArm64Host = abis.any { it.contains("arm64", ignoreCase = true) || it.contains("aarch64", ignoreCase = true) },
+            hostAbis = abi.supportedAbis.ifEmpty { listOf(abi.primaryAbi) },
+            primaryAbi = abi.primaryAbi,
+            isArm64Host = abi.isArm64Compatible,
             nativeBridgeLoaded = NoxerNativeBridge.isNativeLibraryLoaded(),
             eglReport = NoxerNativeBridge.probeEglCapabilities(),
         )
     }
 
-    fun resolveAdoptiumArch(): Pair<String, String> {
-        val abis = Build.SUPPORTED_ABIS?.toList().orEmpty()
-        return when {
-            abis.any { it == "arm64-v8a" } -> "aarch64" to "arm64-v8a"
-            abis.any { it == "x86_64" } -> "x64" to "x86_64"
-            abis.any { it == "armeabi-v7a" } -> "arm" to "armeabi-v7a"
-            else -> "aarch64" to "arm64-v8a"
-        }
+    fun cancelInstall() {
+        cancelRequested = true
+        _installProgress.value = _installProgress.value.copy(
+            phase = "Cancelling",
+            statusText = "Cancelling Java runtime installation...",
+        )
     }
 
-    suspend fun fetchAndInstallRuntime(majorVersion: Int): Result<RuntimeEntity> = withContext(Dispatchers.IO) {
-        val (adoptiumArch, androidAbi) = resolveAdoptiumArch()
-        _installProgress.value = RuntimeInstallProgress(
-            isInstalling = true,
-            majorVersion = majorVersion,
-            statusText = "Querying Eclipse Temurin Java $majorVersion ($adoptiumArch)...",
-            progressFraction = 0.05f,
-        )
+    suspend fun findCompatibleVerifiedRuntime(
+        majorVersion: Int,
+        preferredRuntimeId: String = "auto",
+    ): RuntimeEntity? = withContext(Dispatchers.IO) {
+        val abi = detectAbiInfo()
 
-        try {
-            val apiUrl = "https://api.adoptium.net/v3/assets/feature_releases/$majorVersion/ga" +
-                "?architecture=$adoptiumArch&os=linux&image_type=jre&jvm_impl=hotspot&page_size=5"
-            val req = Request.Builder()
-                .url(apiUrl)
-                .header("User-Agent", "NoxerLauncher/1.0 (Android)")
-                .build()
-            val bodyStr = okHttpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) throw IOException("Adoptium API HTTP ${resp.code}")
-                resp.body?.string() ?: throw IOException("Empty response from Adoptium API")
+        suspend fun checkCandidate(candidate: RuntimeEntity?): RuntimeEntity? {
+            if (candidate == null || !candidate.isInstalled) return null
+            if (candidate.majorVersion != majorVersion) return null
+            val installDir = File(candidate.installPath)
+            if (!installDir.exists()) {
+                runtimeDao.upsert(
+                    candidate.copy(
+                        isInstalled = false,
+                        isVerified = false,
+                        diagnosticMessage = "Runtime directory missing from disk.",
+                    )
+                )
+                return null
+            }
+            if (candidate.abi != abi.primaryAbi && !candidate.abi.equals(abi.primaryAbi, ignoreCase = true)) {
+                return null
+            }
+            // Re-verify if DB didn't record verified status or libjvm.so/bin/java moved
+            val libJvm = File(candidate.libJvmPath).takeIf { it.exists() } ?: ArchiveExtractor.findLibJvm(installDir)
+            if (libJvm == null) {
+                runtimeDao.upsert(
+                    candidate.copy(
+                        isInstalled = false,
+                        isVerified = false,
+                        diagnosticMessage = "libjvm.so missing inside runtime.",
+                    )
+                )
+                return null
+            }
+            if (candidate.isVerified && candidate.libJvmPath == libJvm.absolutePath) {
+                val elf = AndroidRuntimeVerifier.inspectElf(libJvm)
+                if (elf.isValidElf && !elf.hasGlibcDependencies) {
+                    return candidate
+                }
+            }
+            val verified = verifyRuntime(candidate)
+            return verified.takeIf { it.isInstalled && it.isVerified }
+        }
+
+        if (preferredRuntimeId != "auto" && preferredRuntimeId.isNotBlank()) {
+            checkCandidate(runtimeDao.getById(preferredRuntimeId))?.let { return@withContext it }
+        }
+
+        runtimeDao.getVerifiedByMajorVersion(majorVersion)?.let { candidate ->
+            checkCandidate(candidate)?.let { return@withContext it }
+        }
+
+        val all = runtimeDao.getAll().filter { it.majorVersion == majorVersion }
+        for (rt in all) {
+            checkCandidate(rt)?.let { return@withContext it }
+        }
+        null
+    }
+
+    suspend fun ensureRuntimeInstalledAndVerified(
+        majorVersion: Int,
+        preferredRuntimeId: String = "auto",
+        onProgress: ((RuntimeInstallProgress) -> Unit)? = null,
+    ): Result<RuntimeEntity> {
+        findCompatibleVerifiedRuntime(majorVersion, preferredRuntimeId)?.let { existing ->
+            return Result.success(existing)
+        }
+        return fetchAndInstallRuntime(majorVersion = majorVersion, onProgress = onProgress)
+    }
+
+    suspend fun fetchAndInstallRuntime(
+        majorVersion: Int,
+        forceReinstall: Boolean = false,
+        onProgress: ((RuntimeInstallProgress) -> Unit)? = null,
+    ): Result<RuntimeEntity> = withContext(Dispatchers.IO) {
+        installMutex.withLock {
+            cancelRequested = false
+
+            fun publish(
+                phase: String,
+                status: String,
+                fraction: Float,
+                downloadedBytes: Long = _installProgress.value.downloadedBytes,
+                totalBytes: Long = _installProgress.value.totalBytes,
+            ) {
+                val next = RuntimeInstallProgress(
+                    isInstalling = true,
+                    majorVersion = majorVersion,
+                    phase = phase,
+                    statusText = status,
+                    downloadedBytes = downloadedBytes,
+                    totalBytes = totalBytes,
+                    progressFraction = fraction.coerceIn(0f, 1f),
+                )
+                _installProgress.value = next
+                onProgress?.invoke(next)
             }
 
-            val releases = json.decodeFromString<List<AdoptiumRelease>>(bodyStr)
-            val matchedRelease = releases.firstOrNull { rel ->
-                rel.binaries.any { it.pkg?.link?.endsWith(".tar.gz") == true }
-            } ?: throw IOException("No Linux $adoptiumArch JRE .tar.gz release found for Java $majorVersion")
+            if (!forceReinstall) {
+                findCompatibleVerifiedRuntime(majorVersion)?.let { existing ->
+                    _installProgress.value = RuntimeInstallProgress()
+                    return@withLock Result.success(existing)
+                }
+            }
 
-            val pkg = matchedRelease.binaries.first { it.pkg?.link?.endsWith(".tar.gz") == true }.pkg!!
-            val runtimeId = "temurin-${majorVersion}-$androidAbi"
-            val targetDir = paths.runtimeDir(runtimeId)
-            val archiveFile = File(paths.runtimesDir, "$runtimeId.tar.gz")
+            val abi = detectAbiInfo()
+            val runtimeId = "android-openjdk-$majorVersion-${abi.primaryAbi}"
+            val stagingDir = File(paths.runtimesDir, "$runtimeId.staging")
+            val archiveCacheDir = File(paths.runtimesDir, ".downloads/$runtimeId").apply { mkdirs() }
+            val finalDir = paths.runtimeDir(runtimeId)
 
-            _installProgress.value = RuntimeInstallProgress(
-                isInstalling = true,
-                majorVersion = majorVersion,
-                statusText = "Downloading ${matchedRelease.releaseName} (${pkg.size / (1024 * 1024)} MB)...",
-                progressFraction = 0.15f,
+            publish(
+                phase = "Resolving",
+                status = "Detecting Java $majorVersion Android (${abi.primaryAbi}) runtime...",
+                fraction = 0.04f,
+            )
+            consoleLogger.info(
+                "JavaRuntime",
+                "Resolving Java $majorVersion for Android ABI=${abi.primaryAbi} (ARM64 compatible=${abi.isArm64Compatible})",
             )
 
-            val dlReq = Request.Builder().url(pkg.link).build()
-            okHttpClient.newCall(dlReq).execute().use { resp ->
-                if (!resp.isSuccessful) throw IOException("Runtime download HTTP ${resp.code}")
-                val total = resp.body?.contentLength()?.takeIf { it > 0 } ?: pkg.size
-                var readBytes = 0L
-                resp.body?.byteStream()?.use { input ->
-                    FileOutputStream(archiveFile).use { out ->
-                        val buf = ByteArray(32 * 1024)
-                        var n: Int
-                        while (input.read(buf).also { n = it } != -1) {
-                            out.write(buf, 0, n)
-                            readBytes += n
-                            val frac = if (total > 0) 0.15f + 0.55f * (readBytes.toFloat() / total) else 0.4f
-                            _installProgress.value = _installProgress.value.copy(progressFraction = frac.coerceIn(0.15f, 0.70f))
+            try {
+                val candidates = sourceResolver.resolvePackages(majorVersion, abi)
+                if (candidates.isEmpty()) {
+                    throw IOException("No Android-compatible Java $majorVersion runtime found for ${abi.primaryAbi}.")
+                }
+
+                var lastError: Throwable? = null
+                for ((idx, pkg) in candidates.withIndex()) {
+                    if (cancelRequested) throw CancellationException("Runtime installation cancelled")
+                    try {
+                        val totalExpectedBytes = pkg.sizeBytes + pkg.companionPackages.sumOf { it.sizeBytes }
+                        val requiredFreeBytes = if (totalExpectedBytes > 2_000_000L) {
+                            maxOf(totalExpectedBytes * 2L + 64L * 1024L * 1024L, 180L * 1024L * 1024L)
+                        } else {
+                            maxOf(totalExpectedBytes * 2L, 256L * 1024L)
                         }
+                        val freeBytes = availableBytesProvider()
+                        if (freeBytes < requiredFreeBytes) {
+                            throw IOException(
+                                "Insufficient storage for Java $majorVersion: need ${requiredFreeBytes / (1024 * 1024)} MB free, only ${freeBytes / (1024 * 1024)} MB available."
+                            )
+                        }
+
+                        consoleLogger.info(
+                            "JavaRuntime",
+                            "Downloading candidate ${idx + 1}/${candidates.size}: ${pkg.providerName} (${pkg.fullVersion})",
+                        )
+
+                        if (stagingDir.exists()) stagingDir.deleteRecursively()
+                        stagingDir.mkdirs()
+
+                        var aggregateDownloaded = 0L
+                        val effectiveTotal = totalExpectedBytes.coerceAtLeast(1L)
+
+                        // 1. Download & checksum-verify primary archive (resumable .part)
+                        val mainFileName = pkg.downloadUrl.substringAfterLast('/').substringBefore('?')
+                            .ifBlank { "$runtimeId.archive" }
+                        val mainArchive = File(archiveCacheDir, mainFileName)
+                        downloadFileResumable(
+                            url = pkg.downloadUrl,
+                            dest = mainArchive,
+                            expectedSha256 = pkg.sha256,
+                            expectedSize = pkg.sizeBytes,
+                        ) { readDelta, bytesSoFar, fileTotal ->
+                            aggregateDownloaded += readDelta
+                            val dlFraction = if (totalExpectedBytes > 0L) {
+                                0.08f + 0.56f * (aggregateDownloaded.toFloat() / effectiveTotal.toFloat())
+                            } else if (fileTotal > 0L) {
+                                0.08f + 0.56f * (bytesSoFar.toFloat() / fileTotal.toFloat())
+                            } else {
+                                0.35f
+                            }
+                            val dlMb = bytesSoFar / (1024f * 1024f)
+                            val totalMb = (if (fileTotal > 0L) fileTotal else pkg.sizeBytes) / (1024f * 1024f)
+                            val sizeLabel = if (totalMb > 0.1f) {
+                                String.format("%.1f / %.1f MB", dlMb, totalMb)
+                            } else {
+                                "${bytesSoFar / 1024} KB"
+                            }
+                            publish(
+                                phase = "Downloading",
+                                status = "Downloading Java $majorVersion (${pkg.providerName}) • $sizeLabel",
+                                fraction = dlFraction.coerceIn(0.08f, 0.64f),
+                                downloadedBytes = aggregateDownloaded,
+                                totalBytes = totalExpectedBytes.coerceAtLeast(fileTotal),
+                            )
+                        }
+
+                        // 2. Download any split binary / native companion packages
+                        val companionArchives = mutableListOf<Pair<CompanionRuntimePackage, File>>()
+                        for ((cIdx, comp) in pkg.companionPackages.withIndex()) {
+                            if (cancelRequested) throw CancellationException("Runtime installation cancelled")
+                            val compFile = File(archiveCacheDir, "${comp.packageName}_${cIdx}.${comp.format.name.lowercase()}")
+                            downloadFileResumable(
+                                url = comp.downloadUrl,
+                                dest = compFile,
+                                expectedSha256 = comp.sha256,
+                                expectedSize = comp.sizeBytes,
+                            ) { readDelta, _, _ ->
+                                aggregateDownloaded += readDelta
+                                val dlFraction = if (totalExpectedBytes > 0L) {
+                                    0.08f + 0.56f * (aggregateDownloaded.toFloat() / effectiveTotal.toFloat())
+                                } else {
+                                    0.60f
+                                }
+                                publish(
+                                    phase = "Downloading",
+                                    status = "Downloading companion ${comp.packageName} (${cIdx + 1}/${pkg.companionPackages.size})...",
+                                    fraction = dlFraction.coerceIn(0.08f, 0.68f),
+                                    downloadedBytes = aggregateDownloaded,
+                                    totalBytes = totalExpectedBytes,
+                                )
+                            }
+                            companionArchives += comp to compFile
+                        }
+
+                        // 3. Extract archives safely into staging directory
+                        publish(
+                            phase = "Extracting",
+                            status = "Extracting Java $majorVersion (${abi.primaryAbi}) into private storage...",
+                            fraction = 0.72f,
+                        )
+                        ArchiveExtractor.extractArchive(
+                            archive = mainArchive,
+                            format = pkg.format,
+                            destDir = stagingDir,
+                            stripSingleRootDir = (pkg.format != RuntimeArchiveFormat.DEB),
+                        )
+
+                        for ((comp, compFile) in companionArchives) {
+                            if (cancelRequested) throw CancellationException("Runtime installation cancelled")
+                            val prefixFilter = if (comp.format == RuntimeArchiveFormat.DEB) listOf("/lib/", ".so") else null
+                            ArchiveExtractor.extractArchive(
+                                archive = compFile,
+                                format = comp.format,
+                                destDir = stagingDir,
+                                stripSingleRootDir = false,
+                                onlyRelativeSubdirPrefixes = prefixFilter,
+                            )
+                        }
+
+                        publish(
+                            phase = "Configuring",
+                            status = "Configuring permissions, symlinks & library paths...",
+                            fraction = 0.84f,
+                        )
+                        ArchiveExtractor.normalizeExtractedRuntimeLayout(stagingDir)
+                        ArchiveExtractor.configurePermissions(stagingDir)
+
+                        // 4. Real verification BEFORE moving into final installed registry
+                        publish(
+                            phase = "Verifying",
+                            status = "Verifying Java $majorVersion Android compatibility & execution...",
+                            fraction = 0.90f,
+                        )
+                        val verification = verifier.verify(
+                            javaHome = stagingDir,
+                            expectedAbi = abi.primaryAbi,
+                            expectedMajorVersion = majorVersion,
+                        )
+                        if (!verification.isVerified) {
+                            throw IOException("Runtime verification failed: ${verification.diagnosticMessage}")
+                        }
+
+                        // 5. Commit atomically into final runtime location & register in Room DB
+                        if (finalDir.exists()) finalDir.deleteRecursively()
+                        if (!stagingDir.renameTo(finalDir)) {
+                            stagingDir.copyRecursively(finalDir, overwrite = true)
+                            stagingDir.deleteRecursively()
+                        }
+                        ArchiveExtractor.configurePermissions(finalDir)
+
+                        val finalLibJvm = ArchiveExtractor.findLibJvm(finalDir)
+                            ?: throw IOException("libjvm.so disappeared after moving runtime to ${finalDir.absolutePath}")
+                        val finalJavaBin = ArchiveExtractor.findJavaBinary(finalDir)
+                        val diskBytes = finalDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                        val existing = runtimeDao.getById(runtimeId)
+                        val allExisting = runtimeDao.getAll()
+                        val shouldBeDefault = existing?.isDefault ?: allExisting.none { it.isDefault }
+
+                        val entity = RuntimeEntity(
+                            id = runtimeId,
+                            displayName = pkg.displayName,
+                            majorVersion = majorVersion,
+                            fullVersion = verification.detectedJavaVersion.ifBlank { pkg.fullVersion },
+                            abi = abi.primaryAbi,
+                            installPath = finalDir.absolutePath,
+                            libJvmPath = finalLibJvm.absolutePath,
+                            javaBinPath = finalJavaBin?.absolutePath.orEmpty(),
+                            sourceProvider = pkg.providerName,
+                            isDefault = shouldBeDefault,
+                            sha256 = pkg.sha256,
+                            sizeBytes = diskBytes.coerceAtLeast(pkg.sizeBytes),
+                            downloadUrl = pkg.downloadUrl,
+                            isInstalled = true,
+                            isVerified = true,
+                            diagnosticMessage = verification.diagnosticMessage,
+                            installedAt = System.currentTimeMillis(),
+                        )
+                        runtimeDao.upsert(entity)
+                        archiveCacheDir.deleteRecursively()
+
+                        publish(
+                            phase = "Ready",
+                            status = "Java $majorVersion verified and ready (${abi.primaryAbi})",
+                            fraction = 1.0f,
+                        )
+                        consoleLogger.info(
+                            "JavaRuntime",
+                            "Installed & verified ${entity.displayName} at ${entity.installPath} via ${verification.executionMethod}",
+                        )
+                        return@withLock Result.success(entity)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        lastError = t
+                        consoleLogger.warn(
+                            "JavaRuntime",
+                            "Candidate ${pkg.providerName} failed for Java $majorVersion: ${t.message}",
+                        )
+                        if (stagingDir.exists()) stagingDir.deleteRecursively()
                     }
                 }
+
+                throw lastError ?: IOException("All Java $majorVersion Android runtime candidates failed.")
+            } catch (t: Throwable) {
+                if (stagingDir.exists()) stagingDir.deleteRecursively()
+                consoleLogger.error("JavaRuntime", "Failed to install Java $majorVersion: ${t.message}")
+                Result.failure(t)
+            } finally {
+                _installProgress.value = RuntimeInstallProgress()
             }
-
-            if (pkg.checksum.isNotBlank()) {
-                _installProgress.value = _installProgress.value.copy(
-                    statusText = "Verifying SHA-256 checksum...",
-                    progressFraction = 0.72f,
-                )
-                val actualSha256 = DownloadEngine.computeSha256(archiveFile)
-                if (!actualSha256.equals(pkg.checksum, ignoreCase = true)) {
-                    archiveFile.delete()
-                    throw IOException("Runtime SHA-256 mismatch: expected ${pkg.checksum}, got $actualSha256")
-                }
-            }
-
-            _installProgress.value = _installProgress.value.copy(
-                statusText = "Extracting OpenJDK $majorVersion archive...",
-                progressFraction = 0.80f,
-            )
-            if (targetDir.exists()) targetDir.deleteRecursively()
-            targetDir.mkdirs()
-            extractTarGzStrippingRoot(archiveFile, targetDir)
-            archiveFile.delete()
-
-            val libJvm = findLibJvm(targetDir)
-            val verificationNote = verifyRuntimeBinary(libJvm, androidAbi)
-
-            val entity = RuntimeEntity(
-                id = runtimeId,
-                displayName = "Eclipse Temurin JRE $majorVersion ($androidAbi)",
-                majorVersion = majorVersion,
-                fullVersion = matchedRelease.releaseName,
-                abi = androidAbi,
-                installPath = targetDir.absolutePath,
-                libJvmPath = libJvm?.absolutePath.orEmpty(),
-                sha256 = pkg.checksum,
-                sizeBytes = pkg.size,
-                downloadUrl = pkg.link,
-                isInstalled = libJvm != null,
-                isVerified = verificationNote.startsWith("OK"),
-                diagnosticMessage = verificationNote,
-                installedAt = System.currentTimeMillis(),
-            )
-            runtimeDao.upsert(entity)
-            consoleLogger.info("JavaRuntime", "Installed ${entity.displayName}: $verificationNote")
-            Result.success(entity)
-        } catch (t: Throwable) {
-            consoleLogger.error("JavaRuntime", "Failed to install Java $majorVersion: ${t.message}")
-            Result.failure(t)
-        } finally {
-            _installProgress.value = RuntimeInstallProgress()
         }
     }
 
+    suspend fun updateRuntime(
+        runtime: RuntimeEntity,
+        onProgress: ((RuntimeInstallProgress) -> Unit)? = null,
+    ): Result<RuntimeEntity> = fetchAndInstallRuntime(
+        majorVersion = runtime.majorVersion,
+        forceReinstall = true,
+        onProgress = onProgress,
+    )
+
     suspend fun verifyRuntime(runtime: RuntimeEntity): RuntimeEntity = withContext(Dispatchers.IO) {
-        val libJvm = File(runtime.libJvmPath).takeIf { it.exists() } ?: findLibJvm(File(runtime.installPath))
-        val note = verifyRuntimeBinary(libJvm, runtime.abi)
+        val installDir = File(runtime.installPath)
+        if (!installDir.exists()) {
+            val missing = runtime.copy(
+                isInstalled = false,
+                isVerified = false,
+                diagnosticMessage = "ERROR: Runtime directory missing (${runtime.installPath})",
+            )
+            runtimeDao.upsert(missing)
+            return@withContext missing
+        }
+
+        val result = verifier.verify(
+            javaHome = installDir,
+            expectedAbi = runtime.abi,
+            expectedMajorVersion = runtime.majorVersion,
+        )
         val updated = runtime.copy(
-            libJvmPath = libJvm?.absolutePath.orEmpty(),
-            isInstalled = libJvm != null,
-            isVerified = note.startsWith("OK"),
-            diagnosticMessage = note,
+            fullVersion = result.detectedJavaVersion.ifBlank { runtime.fullVersion },
+            libJvmPath = result.libJvmPath.ifBlank { runtime.libJvmPath },
+            javaBinPath = result.javaBinPath,
+            isInstalled = result.libJvmPath.isNotBlank() && File(result.libJvmPath).exists(),
+            isVerified = result.isVerified,
+            diagnosticMessage = result.diagnosticMessage,
         )
         runtimeDao.upsert(updated)
+        consoleLogger.info("JavaRuntime", "Verify ${runtime.id}: ${updated.diagnosticMessage}")
         updated
+    }
+
+    suspend fun setDefaultRuntime(runtime: RuntimeEntity) = withContext(Dispatchers.IO) {
+        runtimeDao.setDefaultRuntime(runtime.id)
+        consoleLogger.info("JavaRuntime", "Set ${runtime.displayName} as default runtime")
     }
 
     suspend fun deleteRuntime(runtime: RuntimeEntity) = withContext(Dispatchers.IO) {
         File(runtime.installPath).deleteRecursively()
         runtimeDao.deleteById(runtime.id)
+        installationDao?.clearRuntimeReference(runtime.id)
+        consoleLogger.info("JavaRuntime", "Removed runtime ${runtime.displayName} (${runtime.id})")
     }
 
-    private fun verifyRuntimeBinary(libJvm: File?, expectedAbi: String): String {
-        if (libJvm == null || !libJvm.exists()) {
-            return "ERROR: libjvm.so not found inside extracted runtime directory."
-        }
-        val elfArch = readElfMachine(libJvm)
-        val abiMatch = when (expectedAbi) {
-            "arm64-v8a" -> elfArch == "AArch64"
-            "x86_64" -> elfArch == "x86-64"
-            "armeabi-v7a" -> elfArch == "ARM"
-            else -> false
-        }
-        if (!abiMatch) {
-            return "ARCH_MISMATCH: libjvm.so ELF machine is $elfArch, host requires $expectedAbi."
-        }
-        val jniProbe = NoxerNativeBridge.probeLibJvm(libJvm.absolutePath)
-        return if (jniProbe.startsWith("OK")) {
-            "OK: ELF $elfArch verified & JNI_CreateJavaVM symbol loadable"
-        } else {
-            // Standard glibc Linux Temurin binaries link against ld-linux-aarch64.so.1/libc.so.6 instead of Android Bionic libc.so
-            "ELF $elfArch verified on disk. Native dlopen note: $jniProbe"
-        }
+    fun buildRuntimeEnvironment(
+        runtime: RuntimeEntity,
+        nativesDir: File? = null,
+    ): RuntimeEnvironment {
+        val javaHome = File(runtime.installPath)
+        val libJvm = File(runtime.libJvmPath).takeIf { it.exists() }
+            ?: ArchiveExtractor.findLibJvm(javaHome)
+            ?: File(javaHome, "lib/server/libjvm.so")
+        val javaBin = runtime.javaBinPath.takeIf { it.isNotBlank() }?.let(::File)?.takeIf { it.exists() }
+            ?: ArchiveExtractor.findJavaBinary(javaHome)
+        return AndroidRuntimeVerifier.buildRuntimeEnvironment(javaHome, libJvm, javaBin, nativesDir)
     }
 
-    private fun findLibJvm(root: File): File? =
-        root.walkTopDown().firstOrNull { it.isFile && it.name == "libjvm.so" }
+    private fun downloadFileResumable(
+        url: String,
+        dest: File,
+        expectedSha256: String,
+        expectedSize: Long,
+        onBytesDelta: (delta: Long, currentFileBytes: Long, totalFileBytes: Long) -> Unit,
+    ) {
+        dest.parentFile?.mkdirs()
+        if (dest.exists() && isChecksumAndSizeValid(dest, expectedSha256, expectedSize)) {
+            onBytesDelta(dest.length(), dest.length(), dest.length())
+            return
+        }
 
-    private fun extractTarGzStrippingRoot(archive: File, destDir: File) {
-        val canonicalDest = destDir.canonicalPath
-        TarArchiveInputStream(GzipCompressorInputStream(BufferedInputStream(FileInputStream(archive)))).use { tar ->
-            var entry = tar.nextEntry
-            while (entry != null) {
-                val relName = entry.name.substringAfter('/', missingDelimiterValue = entry.name)
-                if (relName.isNotBlank()) {
-                    val outFile = File(destDir, relName)
-                    // Zip-Slip protection
-                    if (!outFile.canonicalPath.startsWith(canonicalDest)) {
-                        throw SecurityException("Blocked unsafe tar path: ${entry.name}")
+        val partFile = File(dest.parentFile, "${dest.name}.part")
+        var attempt = 0
+        var lastErr: Throwable? = null
+        while (attempt < 3 && !cancelRequested) {
+            attempt++
+            try {
+                val existingBytes = if (partFile.exists()) partFile.length() else 0L
+                val reqBuilder = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", "NoxerLauncher/1.0 (Android)")
+                if (existingBytes > 0L) {
+                    reqBuilder.header("Range", "bytes=$existingBytes-")
+                }
+
+                okHttpClient.newCall(reqBuilder.build()).execute().use { response ->
+                    val appendMode: Boolean
+                    var currentCount: Long
+                    when (response.code) {
+                        206 -> {
+                            appendMode = true
+                            currentCount = existingBytes
+                        }
+                        200 -> {
+                            appendMode = false
+                            currentCount = 0L
+                        }
+                        416 -> {
+                            partFile.delete()
+                            throw IOException("HTTP 416 range mismatch")
+                        }
+                        else -> throw IOException("HTTP ${response.code} downloading $url")
                     }
-                    if (entry.isDirectory) {
-                        outFile.mkdirs()
-                    } else if (!entry.isSymbolicLink) {
-                        outFile.parentFile?.mkdirs()
-                        FileOutputStream(outFile).use { out -> tar.copyTo(out) }
-                        if ((entry.mode and 0b001001001) != 0) {
-                            outFile.setExecutable(true, false)
+
+                    val body = response.body ?: throw IOException("Empty response body for $url")
+                    val contentLen = body.contentLength()
+                    val resolvedTotal = when {
+                        contentLen > 0L && appendMode -> existingBytes + contentLen
+                        contentLen > 0L -> contentLen
+                        expectedSize > 0L -> expectedSize
+                        else -> -1L
+                    }
+
+                    body.byteStream().use { input ->
+                        FileOutputStream(partFile, appendMode).use { output ->
+                            val buf = ByteArray(32 * 1024)
+                            var n: Int
+                            while (input.read(buf).also { n = it } != -1) {
+                                if (cancelRequested) throw CancellationException("Runtime download cancelled")
+                                output.write(buf, 0, n)
+                                currentCount += n
+                                onBytesDelta(n.toLong(), currentCount, resolvedTotal)
+                            }
+                            output.flush()
                         }
                     }
                 }
-                entry = tar.nextEntry
+
+                if (!isChecksumAndSizeValid(partFile, expectedSha256, expectedSize)) {
+                    partFile.delete()
+                    throw IOException("Checksum or size verification failed for ${dest.name}")
+                }
+
+                if (dest.exists()) dest.delete()
+                if (!partFile.renameTo(dest)) {
+                    partFile.copyTo(dest, overwrite = true)
+                    partFile.delete()
+                }
+                return
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                lastErr = t
+                if (attempt < 3) Thread.sleep(300L * attempt)
             }
         }
+        throw lastErr ?: IOException("Failed downloading $url")
+    }
+
+    private fun isChecksumAndSizeValid(file: File, expectedSha256: String, expectedSize: Long): Boolean {
+        if (!file.exists() || file.length() == 0L) return false
+        if (expectedSize > 0L && file.length() != expectedSize) return false
+        if (expectedSha256.isNotBlank()) {
+            val actual = DownloadEngine.computeSha256(file)
+            if (!actual.equals(expectedSha256, ignoreCase = true)) return false
+        }
+        return true
     }
 
     companion object {
-        fun readElfMachine(file: File): String {
-            if (!file.exists() || file.length() < 20) return "Invalid"
-            val header = ByteArray(20)
-            file.inputStream().use { it.read(header) }
-            if (header[0] != 0x7F.toByte() || header[1] != 'E'.code.toByte() ||
-                header[2] != 'L'.code.toByte() || header[3] != 'F'.code.toByte()
-            ) return "Not-ELF"
-            val eMachine = (header[18].toInt() and 0xFF) or ((header[19].toInt() and 0xFF) shl 8)
-            return when (eMachine) {
-                0xB7 -> "AArch64"
-                0x3E -> "x86-64"
-                0x28 -> "ARM"
-                0x03 -> "x86"
-                else -> "ELF(0x${eMachine.toString(16)})"
-            }
-        }
+        fun readElfMachine(file: File): String = AndroidRuntimeVerifier.inspectElf(file).machineName
     }
 }

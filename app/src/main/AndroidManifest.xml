@@ -41,6 +41,11 @@
             android:screenOrientation="sensorLandscape"
             android:theme="@style/Theme.NoxerLauncher" />
 
+        <service
+            android:name=".noxer.runtime.RuntimeVerificationService"
+            android:exported="false"
+            android:process=":jvm_verify" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

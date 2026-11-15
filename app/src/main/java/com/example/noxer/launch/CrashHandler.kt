@@ -130,9 +130,9 @@ class CrashHandler(
 
         fun defaultRecoveryFor(category: LaunchErrorCategory): String = when (category) {
             LaunchErrorCategory.MISSING_JAVA_RUNTIME ->
-                "Open Settings -> Java Runtimes and download the compatible Java 8/17/21 ARM64 runtime."
+                "Tap INSTALL JAVA below or open Settings -> Java Runtime Manager to download & verify an Android-compatible Java runtime."
             LaunchErrorCategory.UNSUPPORTED_ARCHITECTURE ->
-                "Standard Linux glibc libjvm.so cannot link directly against Android Bionic libc without an Android-compiled Bionic OpenJDK build. Install an Android-bionic ARM64 JRE or check Native Diagnostics."
+                "Standard Linux glibc libjvm.so cannot run on Android Bionic. Use Settings -> Java Runtime Manager to install an Android Bionic ARM64 JRE."
             LaunchErrorCategory.FAILED_DOWNLOADS ->
                 "Check internet connectivity, reduce download concurrency in Settings, and click Repair on the installation."
             LaunchErrorCategory.CORRUPTED_FILES ->

@@ -23,6 +23,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -46,6 +47,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.noxer.download.DownloadProgressState
+import com.example.noxer.launch.LaunchErrorCategory
 import com.example.noxer.launch.LaunchPipelineState
 import com.example.noxer.storage.DirectoryItemInfo
 import com.example.noxer.storage.StorageManager
@@ -54,6 +56,7 @@ import com.example.ui.theme.NoxerBlack
 import com.example.ui.theme.NoxerBorder
 import com.example.ui.theme.NoxerCrimsonContainer
 import com.example.ui.theme.NoxerCrimsonGlow
+import com.example.ui.theme.NoxerCyan
 import com.example.ui.theme.NoxerNeonRed
 import com.example.ui.theme.NoxerSurface
 import com.example.ui.theme.NoxerSurfaceElevated
@@ -159,8 +162,11 @@ fun DownloadProgressBanner(
 fun LaunchStatusDialog(
     state: LaunchPipelineState,
     onDismiss: () -> Unit,
+    onInstallJavaAndRetry: (majorVersion: Int, installationId: String?) -> Unit = { _, _ -> },
+    onOpenRuntimeManager: () -> Unit = {},
 ) {
     if (!state.isLaunching && state.errorMessage == null) return
+    val missingJava = state.missingJavaMajor
     AlertDialog(
         onDismissRequest = { if (!state.isLaunching) onDismiss() },
         containerColor = NoxerSurfaceElevated,
@@ -191,6 +197,20 @@ fun LaunchStatusDialog(
                         color = NoxerNeonRed,
                         trackColor = NoxerBlack,
                     )
+                    if (state.runtimeDownloadDetail.isNotBlank()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = state.runtimeDownloadDetail,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = NoxerCyan,
+                        )
+                        LinearProgressIndicator(
+                            progress = { state.runtimeDownloadProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth().height(5.dp),
+                            color = NoxerCyan,
+                            trackColor = NoxerBlack,
+                        )
+                    }
                 }
                 state.errorMessage?.let { err ->
                     Text(err, style = MaterialTheme.typography.bodyMedium, color = NoxerTextPrimary)
@@ -210,13 +230,47 @@ fun LaunchStatusDialog(
                 }
             }
         },
+        dismissButton = {
+            if (!state.isLaunching && missingJava != null) {
+                OutlinedButton(
+                    onClick = {
+                        onDismiss()
+                        onOpenRuntimeManager()
+                    },
+                    border = BorderStroke(1.dp, NoxerBorder),
+                    modifier = Modifier.testTag("dialog_open_runtime_manager_button"),
+                ) {
+                    Text("Runtime Manager", style = MaterialTheme.typography.labelSmall, color = NoxerCyan)
+                }
+            }
+        },
         confirmButton = {
             if (!state.isLaunching) {
-                Button(
-                    onClick = onDismiss,
-                    colors = ButtonDefaults.buttonColors(containerColor = NoxerNeonRed),
-                ) {
-                    Text("Dismiss")
+                if (missingJava != null && (state.errorCategory == LaunchErrorCategory.MISSING_JAVA_RUNTIME || state.errorCategory == LaunchErrorCategory.UNSUPPORTED_ARCHITECTURE)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = onDismiss,
+                            border = BorderStroke(1.dp, NoxerBorder),
+                        ) {
+                            Text("Close")
+                        }
+                        Button(
+                            onClick = { onInstallJavaAndRetry(missingJava, state.activeInstallationId) },
+                            colors = ButtonDefaults.buttonColors(containerColor = NoxerNeonRed),
+                            modifier = Modifier.testTag("dialog_install_java_button"),
+                        ) {
+                            Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("INSTALL JAVA $missingJava")
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = onDismiss,
+                        colors = ButtonDefaults.buttonColors(containerColor = NoxerNeonRed),
+                    ) {
+                        Text("Dismiss")
+                    }
                 }
             }
         },

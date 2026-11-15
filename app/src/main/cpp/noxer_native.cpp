@@ -363,6 +363,37 @@ Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeSetEnv(
     if (v) env->ReleaseStringUTFChars(value, v);
 }
 
+static void preloadRuntimeCompanionLibs(const std::string& javaHome) {
+    if (javaHome.empty()) return;
+    const char* subDirs[] = {"/lib", "/lib/jli", "/lib/aarch64", "/lib/aarch64/jli", "/lib/arm", "/lib/amd64"};
+    const char* libNames[] = {
+        "libc++_shared.so",
+        "libz.so.1",
+        "libz.so",
+        "libiconv.so",
+        "libandroid-shmem.so",
+        "libandroid-spawn.so",
+        "libjli.so"
+    };
+    for (const char* sub : subDirs) {
+        for (const char* name : libNames) {
+            std::string candidate = javaHome + sub + "/" + name;
+            struct stat st{};
+            if (stat(candidate.c_str(), &st) == 0) {
+                dlopen(candidate.c_str(), RTLD_LAZY | RTLD_GLOBAL);
+            }
+        }
+    }
+}
+
+static std::string inferJavaHomeFromLibJvm(const std::string& libJvmPath) {
+    auto pos = libJvmPath.rfind("/lib/");
+    if (pos != std::string::npos) {
+        return libJvmPath.substr(0, pos);
+    }
+    return "";
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeProbeLibJvm(
         JNIEnv* env, jobject, jstring libJvmPath) {
@@ -376,6 +407,8 @@ Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeProbeLibJvm(
         env->ReleaseStringUTFChars(libJvmPath, path);
         return env->NewStringUTF(msg.c_str());
     }
+
+    preloadRuntimeCompanionLibs(inferJavaHomeFromLibJvm(path));
 
     void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
@@ -398,6 +431,108 @@ Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeProbeLibJvm(
     dlclose(handle);
     env->ReleaseStringUTFChars(libJvmPath, path);
     return env->NewStringUTF("OK: libjvm.so loaded and JNI_CreateJavaVM symbol verified");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeVerifyJvmExecution(
+        JNIEnv* env, jobject, jstring jLibJvmPath, jstring jJavaHome) {
+    const char* libJvmPath = env->GetStringUTFChars(jLibJvmPath, nullptr);
+    const char* javaHome = env->GetStringUTFChars(jJavaHome, nullptr);
+    if (!libJvmPath || !javaHome) {
+        if (libJvmPath) env->ReleaseStringUTFChars(jLibJvmPath, libJvmPath);
+        if (javaHome) env->ReleaseStringUTFChars(jJavaHome, javaHome);
+        return env->NewStringUTF("ERROR: Invalid runtime paths");
+    }
+
+    std::string homeStr(javaHome);
+    std::string libPathStr(libJvmPath);
+    env->ReleaseStringUTFChars(jLibJvmPath, libJvmPath);
+    env->ReleaseStringUTFChars(jJavaHome, javaHome);
+
+    struct stat st{};
+    if (stat(libPathStr.c_str(), &st) != 0) {
+        return env->NewStringUTF(("MISSING: libjvm.so not found at " + libPathStr).c_str());
+    }
+
+    setenv("JAVA_HOME", homeStr.c_str(), 1);
+    preloadRuntimeCompanionLibs(homeStr);
+
+    void* jvmHandle = dlopen(libPathStr.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!jvmHandle) {
+        const char* err = dlerror();
+        return env->NewStringUTF((std::string("DLOPEN_FAILED: ") + (err ? err : "unknown")).c_str());
+    }
+
+    auto createJavaVm = reinterpret_cast<CreateJavaVMFn>(dlsym(jvmHandle, "JNI_CreateJavaVM"));
+    if (!createJavaVm) {
+        dlclose(jvmHandle);
+        return env->NewStringUTF("SYMBOL_MISSING: JNI_CreateJavaVM not found in libjvm.so");
+    }
+
+    std::string propHome = "-Djava.home=" + homeStr;
+    std::string propHeadless = "-Djava.awt.headless=true";
+    std::string optXms = "-Xms16m";
+    std::string optXmx = "-Xmx64m";
+    JavaVMOptionCompat options[4] = {
+        {const_cast<char*>(propHome.c_str()), nullptr},
+        {const_cast<char*>(propHeadless.c_str()), nullptr},
+        {const_cast<char*>(optXms.c_str()), nullptr},
+        {const_cast<char*>(optXmx.c_str()), nullptr},
+    };
+    JavaVMInitArgsCompat vmArgs{};
+    vmArgs.version = JNI_VERSION_1_6;
+    vmArgs.nOptions = 4;
+    vmArgs.options = options;
+    vmArgs.ignoreUnrecognized = JNI_TRUE;
+
+    JavaVM* targetVm = nullptr;
+    JNIEnv* targetEnv = nullptr;
+    jint createRes = createJavaVm(&targetVm, reinterpret_cast<void**>(&targetEnv), &vmArgs);
+    if (createRes != JNI_OK || !targetVm || !targetEnv) {
+        return env->NewStringUTF(("CREATE_VM_FAILED: JNI_CreateJavaVM returned " + std::to_string(createRes)).c_str());
+    }
+
+    auto readSysProp = [&](const char* key) -> std::string {
+        jclass sysCls = targetEnv->FindClass("java/lang/System");
+        if (!sysCls) {
+            if (targetEnv->ExceptionCheck()) targetEnv->ExceptionClear();
+            return "";
+        }
+        jmethodID getProp = targetEnv->GetStaticMethodID(sysCls, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;");
+        if (!getProp) {
+            if (targetEnv->ExceptionCheck()) targetEnv->ExceptionClear();
+            return "";
+        }
+        jstring jKey = targetEnv->NewStringUTF(key);
+        auto jVal = static_cast<jstring>(targetEnv->CallStaticObjectMethod(sysCls, getProp, jKey));
+        targetEnv->DeleteLocalRef(jKey);
+        if (targetEnv->ExceptionCheck()) {
+            targetEnv->ExceptionClear();
+            return "";
+        }
+        if (!jVal) return "";
+        const char* cVal = targetEnv->GetStringUTFChars(jVal, nullptr);
+        std::string res = cVal ? cVal : "";
+        if (cVal) targetEnv->ReleaseStringUTFChars(jVal, cVal);
+        targetEnv->DeleteLocalRef(jVal);
+        return res;
+    };
+
+    std::string javaVersion = readSysProp("java.version");
+    std::string vmName = readSysProp("java.vm.name");
+    std::string osArch = readSysProp("os.arch");
+
+    targetVm->DestroyJavaVM();
+
+    if (javaVersion.empty()) {
+        return env->NewStringUTF("VERIFY_FAILED: JVM started but java.version property was empty");
+    }
+
+    std::string result = "OK: Executed JVM " + javaVersion;
+    if (!vmName.empty() || !osArch.empty()) {
+        result += " (" + vmName + (osArch.empty() ? "" : ", " + osArch) + ")";
+    }
+    return env->NewStringUTF(result.c_str());
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -429,6 +564,9 @@ Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeLaunchJvm(
             }
         }
     };
+
+    const char* envJavaHome = getenv("JAVA_HOME");
+    preloadRuntimeCompanionLibs(envJavaHome ? std::string(envJavaHome) : inferJavaHomeFromLibJvm(libJvmPath));
 
     void* jvmHandle = dlopen(libJvmPath, RTLD_NOW | RTLD_GLOBAL);
     if (!jvmHandle) {

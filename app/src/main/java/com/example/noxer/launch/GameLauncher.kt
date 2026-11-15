@@ -23,6 +23,7 @@ import com.example.noxer.mods.FabricProfileJson
 import com.example.noxer.mods.ModLoaderManager
 import com.example.noxer.nativebridge.NativeLogCallback
 import com.example.noxer.nativebridge.NoxerNativeBridge
+import com.example.noxer.runtime.JavaRuntimeManager
 import com.example.noxer.version.VersionCenterRepository
 import com.example.noxer.version.VersionDetails
 import kotlinx.coroutines.CoroutineScope
@@ -43,7 +44,11 @@ data class LaunchPipelineState(
     val totalSteps: Int = 16,
     val stepTitle: String = "Idle",
     val activeInstallationName: String? = null,
+    val activeInstallationId: String? = null,
     val authModeLabel: String = "",
+    val runtimeDownloadProgress: Float = 0f,
+    val runtimeDownloadDetail: String = "",
+    val missingJavaMajor: Int? = null,
     val generatedCommandPreview: String = "",
     val errorCategory: LaunchErrorCategory? = null,
     val errorMessage: String? = null,
@@ -61,11 +66,22 @@ data class PreparedLaunchPlan(
     val envVars: Map<String, String>,
 )
 
+fun interface JvmLauncherBackend {
+    fun launchJvm(
+        libJvmPath: String,
+        jvmOptions: Array<String>,
+        mainClass: String,
+        gameArgs: Array<String>,
+        callback: NativeLogCallback,
+    ): Int
+}
+
 class GameLauncher(
     private val context: Context,
     private val paths: NoxerPaths,
     private val installationDao: InstallationDao,
     private val runtimeDao: RuntimeDao,
+    private val runtimeManager: JavaRuntimeManager,
     private val authManager: MicrosoftAuthManager,
     private val offlineProfileManager: OfflineProfileManager,
     private val accountSessionManager: AccountSessionManager,
@@ -75,6 +91,10 @@ class GameLauncher(
     private val crashHandler: CrashHandler,
     private val consoleLogger: ConsoleLogger,
     private val json: Json,
+    private val jvmBackend: JvmLauncherBackend = JvmLauncherBackend { libJvmPath, jvmOptions, mainClass, gameArgs, callback ->
+        NoxerNativeBridge.launchJvm(libJvmPath, jvmOptions, mainClass, gameArgs, callback)
+    },
+    private val startViewportActivity: Boolean = true,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -97,12 +117,16 @@ class GameLauncher(
 
     suspend fun executePipeline(installationId: String) {
         val capturedLogs = mutableListOf<String>()
-        fun step(n: Int, title: String, name: String? = null) {
+        fun step(n: Int, title: String, name: String? = null, detail: String = "", dlFrac: Float = 0f) {
             _state.value = _state.value.copy(
                 isLaunching = true,
                 currentStep = n,
                 stepTitle = title,
                 activeInstallationName = name ?: _state.value.activeInstallationName,
+                activeInstallationId = installationId,
+                runtimeDownloadProgress = dlFrac,
+                runtimeDownloadDetail = detail,
+                missingJavaMajor = null,
                 errorCategory = null,
                 errorMessage = null,
                 recoveryAction = null,
@@ -116,6 +140,7 @@ class GameLauncher(
             category: LaunchErrorCategory,
             message: String,
             code: Int = -1,
+            missingJavaMajor: Int? = null,
         ) {
             val recovery = CrashHandler.defaultRecoveryFor(category)
             consoleLogger.error("Launch", "$message — $recovery")
@@ -136,6 +161,8 @@ class GameLauncher(
                 currentStep = _state.value.currentStep,
                 stepTitle = "Launch Failed",
                 activeInstallationName = install?.name,
+                activeInstallationId = install?.id,
+                missingJavaMajor = missingJavaMajor,
                 errorCategory = category,
                 errorMessage = message,
                 recoveryAction = recovery,
@@ -143,7 +170,7 @@ class GameLauncher(
         }
 
         // Step 1: Validate selected installation
-        val install = installationDao.getById(installationId)
+        var install = installationDao.getById(installationId)
         if (install == null) {
             fail(null, LaunchErrorCategory.FAILED_GAME_LAUNCH, "Selected installation no longer exists.")
             return
@@ -151,7 +178,7 @@ class GameLauncher(
         step(1, "Validating installation '${install.name}'...", install.name)
 
         // Check storage space (> 64 MB free)
-        val freeBytes = runCatching { StatFs(paths.rootDir.absolutePath).availableBytes }.getOrDefault(0L)
+        val freeBytes = runCatching { StatFs(paths.rootDir.absolutePath).availableBytes }.getOrDefault(Long.MAX_VALUE)
         if (freeBytes < 64L * 1024L * 1024L) {
             fail(install, LaunchErrorCategory.INSUFFICIENT_STORAGE, "Less than 64 MB free internal storage remaining.")
             return
@@ -220,8 +247,8 @@ class GameLauncher(
         }
         _state.value = _state.value.copy(authModeLabel = authModeLabel)
 
-        // Step 3: Verify Java runtime
-        step(3, "Verifying Android-compatible Java runtime...")
+        // Step 3: Autonomous Android Java Runtime detection, installation, verification & assignment
+        step(3, "Detecting required Java version & Android architecture...")
         val versionJsonFile = paths.versionJsonFile(install.minecraftVersionId)
         if (!versionJsonFile.exists()) {
             fail(install, LaunchErrorCategory.CORRUPTED_FILES, "Version metadata ${install.minecraftVersionId}.json is missing. Run Repair.")
@@ -235,19 +262,64 @@ class GameLauncher(
         }
 
         val requiredJava = VersionCenterRepository.inferRequiredJavaMajor(install.minecraftVersionId, versionDetails)
-        val runtime = if (install.javaRuntimeId == "auto") {
-            runtimeDao.getInstalledByMajorVersion(requiredJava)
+        val abiInfo = runtimeManager.detectAbiInfo()
+        consoleLogger.info(
+            "LaunchRuntime",
+            "Minecraft ${install.minecraftVersionId} requires Java $requiredJava on ${abiInfo.primaryAbi} (arm64Compatible=${abiInfo.isArm64Compatible})",
+        )
+
+        val existingVerified = runtimeManager.findCompatibleVerifiedRuntime(
+            majorVersion = requiredJava,
+            preferredRuntimeId = install.javaRuntimeId,
+        )
+
+        val runtime = if (existingVerified != null) {
+            existingVerified
         } else {
-            runtimeDao.getById(install.javaRuntimeId)
-        }
-        if (runtime == null || !runtime.isInstalled || !File(runtime.libJvmPath).exists()) {
-            fail(
-                install,
-                LaunchErrorCategory.MISSING_JAVA_RUNTIME,
-                "Minecraft ${install.minecraftVersionId} requires Java $requiredJava (${runtime?.displayName ?: "none installed"}).",
+            step(
+                n = 3,
+                title = "Java $requiredJava missing — installing Android (${abiInfo.primaryAbi}) runtime...",
+                detail = "Resolving Android OpenJDK $requiredJava...",
+                dlFrac = 0.03f,
             )
-            return
+            val installRes = runtimeManager.ensureRuntimeInstalledAndVerified(
+                majorVersion = requiredJava,
+                preferredRuntimeId = install.javaRuntimeId,
+            ) { progress ->
+                _state.value = _state.value.copy(
+                    isLaunching = true,
+                    currentStep = 3,
+                    stepTitle = "Installing Java $requiredJava (${abiInfo.primaryAbi}) — ${progress.phase}",
+                    runtimeDownloadProgress = progress.progressFraction,
+                    runtimeDownloadDetail = progress.statusText,
+                )
+            }
+
+            installRes.getOrElse { err ->
+                val msg = err.message ?: "Unable to install Java $requiredJava"
+                val cat = when {
+                    msg.contains("storage", ignoreCase = true) -> LaunchErrorCategory.INSUFFICIENT_STORAGE
+                    msg.contains("ARCH_MISMATCH", ignoreCase = true) || msg.contains("GLIBC", ignoreCase = true) ->
+                        LaunchErrorCategory.UNSUPPORTED_ARCHITECTURE
+                    else -> LaunchErrorCategory.MISSING_JAVA_RUNTIME
+                }
+                fail(
+                    install = install,
+                    category = cat,
+                    message = "Minecraft ${install.minecraftVersionId} requires Java $requiredJava (${abiInfo.primaryAbi}): $msg",
+                    missingJavaMajor = requiredJava,
+                )
+                return
+            }
         }
+
+        // Automatically assign verified runtime to the selected installation
+        if (install.javaRuntimeId != runtime.id) {
+            install = install.copy(javaRuntimeId = runtime.id)
+            installationDao.upsert(install)
+            consoleLogger.info("LaunchRuntime", "Assigned ${runtime.displayName} (${runtime.id}) to '${install.name}'")
+        }
+        _state.value = _state.value.copy(runtimeDownloadProgress = 0f, runtimeDownloadDetail = "")
 
         // Step 4: Check game files
         step(4, "Verifying client JAR & library SHA-1 integrity...")
@@ -297,18 +369,16 @@ class GameLauncher(
         }
         val classpathStr = cpFiles.distinctBy { it.absolutePath }.joinToString(":") { it.absolutePath }
 
-        // Step 8: Generate JVM arguments
-        step(8, "Building JVM arguments (-Xmx${install.memoryMb}M)...")
-        val jvmOptions = mutableListOf<String>()
-        jvmOptions += "-Xms${(install.memoryMb / 2).coerceAtLeast(256)}M"
-        jvmOptions += "-Xmx${install.memoryMb}M"
-        jvmOptions += "-Djava.class.path=$classpathStr"
-        jvmOptions += "-Djava.library.path=${nativesDir.absolutePath}:${context.applicationInfo.nativeLibraryDir}"
-        jvmOptions += "-Dorg.lwjgl.librarypath=${nativesDir.absolutePath}"
-        jvmOptions += "-Dos.name=Linux"
-        jvmOptions += "-Dminecraft.launcher.brand=noxer-launcher"
-        jvmOptions += "-Dminecraft.launcher.version=1.0.0"
-        install.jvmArgs.split(Regex("\\s+")).filter { it.isNotBlank() }.forEach { jvmOptions += it }
+        // Step 8: Generate JVM arguments compatible with Java 8 / 17 / 21 / 25+
+        step(8, "Building Java ${runtime.majorVersion} arguments (-Xmx${install.memoryMb}M)...")
+        val runtimeEnv = runtimeManager.buildRuntimeEnvironment(runtime, nativesDir)
+        val jvmOptions = buildCompatibleJvmOptions(
+            install = install,
+            runtime = runtime,
+            classpathStr = classpathStr,
+            nativesDir = nativesDir,
+            appNativeLibDir = context.applicationInfo.nativeLibraryDir.orEmpty(),
+        )
 
         // Step 9: Generate Minecraft game arguments
         step(9, "Resolving Minecraft game arguments...")
@@ -324,12 +394,12 @@ class GameLauncher(
             height = (install.resolutionHeight * install.resolutionScalePercent / 100).coerceAtLeast(240),
         )
 
-        // Step 10: Configure graphics
-        step(10, "Configuring ${install.rendererId} graphics pipeline...")
+        // Step 10: Configure graphics & Java runtime environment
+        step(10, "Configuring ${install.rendererId} graphics & JAVA_HOME...")
         val backend = RendererBackend.entries.firstOrNull { it.id == install.rendererId } ?: RendererBackend.GL4ES_GLES3
         val envVars = rendererManager.getEnvironmentVariables(backend, install.resolutionScalePercent).toMutableMap()
         envVars["HOME"] = gameDir.absolutePath
-        envVars["JAVA_HOME"] = runtime.installPath
+        envVars.putAll(runtimeEnv.envVars)
         envVars.forEach { (k, v) -> NoxerNativeBridge.setEnv(k, v) }
 
         val plan = PreparedLaunchPlan(
@@ -351,20 +421,22 @@ class GameLauncher(
         step(11, "Opening EGL / OpenGL ES 3.0 viewport & input engine...")
         installationDao.upsert(install.copy(lastPlayedAt = System.currentTimeMillis()))
 
-        val intent = Intent(context, GameViewportActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            putExtra(GameViewportActivity.EXTRA_INSTANCE_ID, install.id)
+        if (startViewportActivity) {
+            val intent = Intent(context, GameViewportActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                putExtra(GameViewportActivity.EXTRA_INSTANCE_ID, install.id)
+            }
+            context.startActivity(intent)
         }
-        context.startActivity(intent)
 
         // Steps 12-16: Start JVM via JNI bridge, capture logs & handle exit/crash
-        step(12, "Starting JVM via NoxerNativeBridge (${runtime.abi})...")
+        step(12, "Starting Java ${runtime.majorVersion} VM (${runtime.abi})...")
         val jvmProbe = NoxerNativeBridge.probeLibJvm(runtime.libJvmPath)
         consoleLogger.info("JVM", "libjvm.so probe: $jvmProbe")
 
         step(13, "Displaying real game viewport & forwarding input...")
         step(14, "Monitoring JVM execution & process output...")
-        val exitCode = NoxerNativeBridge.launchJvm(
+        val exitCode = jvmBackend.launchJvm(
             libJvmPath = runtime.libJvmPath,
             jvmOptions = jvmOptions.toTypedArray(),
             mainClass = effectiveMainClass,
@@ -399,8 +471,48 @@ class GameLauncher(
                 currentStep = 16,
                 stepTitle = "Session ended cleanly (exit 0)",
                 activeInstallationName = install.name,
+                activeInstallationId = install.id,
             )
         }
+    }
+
+    fun buildCompatibleJvmOptions(
+        install: InstallationEntity,
+        runtime: RuntimeEntity,
+        classpathStr: String,
+        nativesDir: File,
+        appNativeLibDir: String,
+    ): List<String> {
+        val jvmOptions = mutableListOf<String>()
+        jvmOptions += "-Xms${(install.memoryMb / 2).coerceAtLeast(256)}M"
+        jvmOptions += "-Xmx${install.memoryMb}M"
+        jvmOptions += "-Djava.home=${runtime.installPath}"
+        jvmOptions += "-Djava.class.path=$classpathStr"
+        val libPathParts = listOfNotNull(
+            nativesDir.absolutePath,
+            appNativeLibDir.takeIf { it.isNotBlank() },
+            File(runtime.installPath, "lib").takeIf { it.exists() }?.absolutePath,
+        )
+        jvmOptions += "-Djava.library.path=${libPathParts.joinToString(":")}"
+        jvmOptions += "-Dorg.lwjgl.librarypath=${nativesDir.absolutePath}"
+        jvmOptions += "-Dos.name=Linux"
+        jvmOptions += "-Duser.home=${install.gameDirPath}"
+        jvmOptions += "-Dminecraft.launcher.brand=noxer-launcher"
+        jvmOptions += "-Dminecraft.launcher.version=1.0.0"
+
+        if (runtime.majorVersion >= 17) {
+            jvmOptions += "--add-opens=java.base/java.lang=ALL-UNNAMED"
+            jvmOptions += "--add-opens=java.base/java.util=ALL-UNNAMED"
+        }
+
+        val rawCustom = install.jvmArgs.split(Regex("\\s+")).filter { it.isNotBlank() }
+        for (arg in rawCustom) {
+            if (runtime.majorVersion <= 8 && (arg.startsWith("--add-opens") || arg.startsWith("--add-exports"))) {
+                continue
+            }
+            jvmOptions += arg
+        }
+        return jvmOptions.distinct()
     }
 
     fun buildGameArguments(

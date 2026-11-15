@@ -64,6 +64,10 @@ object NoxerNativeBridge {
         if (nativeLoaded) nativeProbeLibJvm(libJvmPath)
         else "NATIVE_UNAVAILABLE: ${loadError ?: "libnoxer_native.so not loaded"}"
 
+    fun verifyJvmExecution(libJvmPath: String, javaHome: String): String =
+        if (nativeLoaded) nativeVerifyJvmExecution(libJvmPath, javaHome)
+        else "NATIVE_UNAVAILABLE: ${loadError ?: "libnoxer_native.so not loaded"}"
+
     fun launchJvm(
         libJvmPath: String,
         jvmOptions: Array<String>,
@@ -88,6 +92,7 @@ object NoxerNativeBridge {
     private external fun nativeGetPendingInputCount(): Int
     private external fun nativeSetEnv(key: String, value: String)
     private external fun nativeProbeLibJvm(libJvmPath: String): String
+    private external fun nativeVerifyJvmExecution(libJvmPath: String, javaHome: String): String
     private external fun nativeLaunchJvm(
         libJvmPath: String,
         jvmOptions: Array<String>,

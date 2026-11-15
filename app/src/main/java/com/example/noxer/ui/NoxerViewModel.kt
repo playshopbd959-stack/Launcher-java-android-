@@ -25,6 +25,7 @@ import com.example.noxer.installation.CreateInstallationRequest
 import com.example.noxer.launch.LaunchPipelineState
 import com.example.noxer.mods.InstalledModInfo
 import com.example.noxer.mods.LoaderVersionOption
+import com.example.noxer.runtime.AndroidAbiInfo
 import com.example.noxer.runtime.RuntimeDiagnostics
 import com.example.noxer.runtime.RuntimeInstallProgress
 import com.example.noxer.settings.LauncherSettings
@@ -440,9 +441,41 @@ class NoxerViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val res = container.runtimeManager.fetchAndInstallRuntime(majorVersion)
             _uiToast.value = res.fold(
-                onSuccess = { "Installed ${it.displayName}" },
+                onSuccess = { "Verified & installed ${it.displayName}" },
                 onFailure = { "Java $majorVersion install failed: ${it.message}" },
             )
+            refreshStorageAndDevices()
+        }
+    }
+
+    fun installAndContinueLaunch(majorVersion: Int, installationId: String?) {
+        viewModelScope.launch {
+            container.gameLauncher.clearError()
+            val res = container.runtimeManager.fetchAndInstallRuntime(majorVersion)
+            if (res.isSuccess) {
+                _uiToast.value = "Verified Java $majorVersion — continuing launch"
+                if (!installationId.isNullOrBlank()) {
+                    container.gameLauncher.launchInstallation(installationId)
+                }
+            } else {
+                _uiToast.value = "Java $majorVersion install failed: ${res.exceptionOrNull()?.message}"
+            }
+            refreshStorageAndDevices()
+        }
+    }
+
+    fun cancelJavaRuntimeInstall() {
+        container.runtimeManager.cancelInstall()
+    }
+
+    fun updateJavaRuntime(runtime: RuntimeEntity) {
+        viewModelScope.launch {
+            val res = container.runtimeManager.updateRuntime(runtime)
+            _uiToast.value = res.fold(
+                onSuccess = { "Updated & verified ${it.displayName}" },
+                onFailure = { "Update failed: ${it.message}" },
+            )
+            refreshStorageAndDevices()
         }
     }
 
@@ -453,13 +486,27 @@ class NoxerViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setDefaultJavaRuntime(runtime: RuntimeEntity) {
+        viewModelScope.launch {
+            container.runtimeManager.setDefaultRuntime(runtime)
+            _uiToast.value = "Default runtime set to ${runtime.displayName}"
+        }
+    }
+
     fun deleteJavaRuntime(runtime: RuntimeEntity) {
         viewModelScope.launch {
             container.runtimeManager.deleteRuntime(runtime)
+            _uiToast.value = "Removed ${runtime.displayName}"
+            refreshStorageAndDevices()
         }
     }
 
     fun getRuntimeHostDiagnostics(): RuntimeDiagnostics = container.runtimeManager.getHostDiagnostics()
+
+    fun getRuntimeAbiInfo(): AndroidAbiInfo = container.runtimeManager.detectAbiInfo()
+
+    fun getRuntimeAvailableBytes(): Long =
+        runCatching { android.os.StatFs(container.paths.runtimesDir.absolutePath).availableBytes }.getOrDefault(0L)
 
     // Mods & Loaders
     fun selectModInstance(instance: InstallationEntity) {

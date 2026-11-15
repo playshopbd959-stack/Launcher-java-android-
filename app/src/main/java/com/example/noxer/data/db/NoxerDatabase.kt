@@ -30,6 +30,9 @@ interface InstallationDao {
     @Update
     suspend fun update(entity: InstallationEntity)
 
+    @Query("UPDATE installations SET javaRuntimeId = 'auto' WHERE javaRuntimeId = :runtimeId")
+    suspend fun clearRuntimeReference(runtimeId: String)
+
     @Query("DELETE FROM installations WHERE id = :id")
     suspend fun deleteById(id: String)
 }
@@ -96,14 +99,35 @@ interface OfflineProfileDao {
 
 @Dao
 interface RuntimeDao {
-    @Query("SELECT * FROM runtimes ORDER BY majorVersion DESC")
+    @Query("SELECT * FROM runtimes ORDER BY isDefault DESC, majorVersion DESC, installedAt DESC")
     fun observeAll(): Flow<List<RuntimeEntity>>
+
+    @Query("SELECT * FROM runtimes ORDER BY isDefault DESC, majorVersion DESC, installedAt DESC")
+    suspend fun getAll(): List<RuntimeEntity>
 
     @Query("SELECT * FROM runtimes WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): RuntimeEntity?
 
-    @Query("SELECT * FROM runtimes WHERE majorVersion = :majorVersion AND isInstalled = 1 LIMIT 1")
+    @Query("SELECT * FROM runtimes WHERE majorVersion = :majorVersion AND isInstalled = 1 AND isVerified = 1 ORDER BY isDefault DESC, installedAt DESC LIMIT 1")
+    suspend fun getVerifiedByMajorVersion(majorVersion: Int): RuntimeEntity?
+
+    @Query("SELECT * FROM runtimes WHERE majorVersion = :majorVersion AND isInstalled = 1 ORDER BY isVerified DESC, isDefault DESC, installedAt DESC LIMIT 1")
     suspend fun getInstalledByMajorVersion(majorVersion: Int): RuntimeEntity?
+
+    @Query("SELECT * FROM runtimes WHERE isDefault = 1 AND isInstalled = 1 LIMIT 1")
+    suspend fun getDefaultRuntime(): RuntimeEntity?
+
+    @Query("UPDATE runtimes SET isDefault = 0")
+    suspend fun clearDefaultFlags()
+
+    @Query("UPDATE runtimes SET isDefault = 1 WHERE id = :id")
+    suspend fun markDefault(id: String)
+
+    @Transaction
+    suspend fun setDefaultRuntime(id: String) {
+        clearDefaultFlags()
+        markDefault(id)
+    }
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(runtime: RuntimeEntity)
@@ -183,7 +207,7 @@ interface CrashReportDao {
         ConsoleLogEntity::class,
         CrashReportEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = false,
 )
 abstract class NoxerDatabase : RoomDatabase() {

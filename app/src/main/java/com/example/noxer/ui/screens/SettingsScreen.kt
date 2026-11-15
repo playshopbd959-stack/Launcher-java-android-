@@ -81,6 +81,7 @@ fun SettingsScreen(
     onInstallRuntime: (Int) -> Unit,
     onVerifyRuntime: (RuntimeEntity) -> Unit,
     onDeleteRuntime: (RuntimeEntity) -> Unit,
+    onOpenRuntimeManager: () -> Unit = {},
     onExportBackupSaf: (File, Uri) -> Unit,
     onRestoreBackupSaf: (Uri, File) -> Unit,
     onRefreshDiagnostics: () -> Unit,
@@ -110,10 +111,27 @@ fun SettingsScreen(
         // Java Runtime Engine
         item {
             NoxerPanel(highlighted = true) {
-                Text("JAVA RUNTIME ENGINE (${hostDiagnostics.primaryAbi})", style = MaterialTheme.typography.labelMedium, color = NoxerNeonRed)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "JAVA RUNTIME ENGINE (${hostDiagnostics.primaryAbi})",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = NoxerNeonRed,
+                    )
+                    OutlinedButton(
+                        onClick = onOpenRuntimeManager,
+                        border = BorderStroke(1.dp, NoxerNeonRed.copy(alpha = 0.6f)),
+                        modifier = Modifier.testTag("open_runtime_manager_button"),
+                    ) {
+                        Text("RUNTIME MANAGER", style = MaterialTheme.typography.labelSmall, color = NoxerNeonRed)
+                    }
+                }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = "Supported ABIs: ${hostDiagnostics.hostAbis.joinToString()} • Native JNI: ${if (hostDiagnostics.nativeBridgeLoaded) "Loaded" else "Unavailable"}",
+                    text = "Supported ABIs: ${hostDiagnostics.hostAbis.joinToString()} • ARM64: ${if (hostDiagnostics.isArm64Host) "Compatible" else "No"} • Native JNI: ${if (hostDiagnostics.nativeBridgeLoaded) "Loaded" else "Standby"}",
                     style = MaterialTheme.typography.bodySmall,
                     color = NoxerTextSecondary,
                 )
@@ -131,7 +149,7 @@ fun SettingsScreen(
                     Spacer(Modifier.height(8.dp))
                 }
 
-                Text("Download Official Eclipse Temurin Linux JRE:", style = MaterialTheme.typography.labelSmall, color = NoxerTextMuted)
+                Text("Quick Install Android-Bionic OpenJDK:", style = MaterialTheme.typography.labelSmall, color = NoxerTextMuted)
                 Spacer(Modifier.height(6.dp))
                 Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(8, 17, 21, 25).forEach { major ->
@@ -162,6 +180,9 @@ fun SettingsScreen(
                                     Text(rt.displayName, style = MaterialTheme.typography.titleSmall, color = NoxerTextPrimary)
                                     if (rt.isVerified) {
                                         Icon(Icons.Default.CheckCircle, contentDescription = "Verified", tint = NoxerEmerald, modifier = Modifier.size(15.dp))
+                                    }
+                                    if (rt.isDefault) {
+                                        NoxerBadge("DEFAULT", NoxerNeonRed)
                                     }
                                 }
                                 Text(rt.diagnosticMessage ?: rt.fullVersion, style = MaterialTheme.typography.labelSmall, color = NoxerTextSecondary)

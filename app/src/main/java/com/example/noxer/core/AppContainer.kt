@@ -17,6 +17,7 @@ import com.example.noxer.launch.CrashHandler
 import com.example.noxer.launch.GameLauncher
 import com.example.noxer.mods.ModLoaderManager
 import com.example.noxer.runtime.JavaRuntimeManager
+import com.example.noxer.runtime.RuntimeVerificationService
 import com.example.noxer.settings.SettingsManager
 import com.example.noxer.storage.StorageManager
 import com.example.noxer.version.MojangManifestApi
@@ -45,6 +46,14 @@ private val MIGRATION_1_2 = object : Migration(1, 2) {
     }
 }
 
+private val MIGRATION_2_3 = object : Migration(2, 3) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE runtimes ADD COLUMN `javaBinPath` TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE runtimes ADD COLUMN `sourceProvider` TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE runtimes ADD COLUMN `isDefault` INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
 
@@ -68,7 +77,7 @@ class AppContainer(context: Context) {
         NoxerDatabase::class.java,
         "noxer_launcher.db",
     )
-        .addMigrations(MIGRATION_1_2)
+        .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
         .fallbackToDestructiveMigration(dropAllTables = true)
         .build()
 
@@ -131,6 +140,8 @@ class AppContainer(context: Context) {
         runtimeDao = database.runtimeDao(),
         paths = paths,
         consoleLogger = consoleLogger,
+        installationDao = database.installationDao(),
+        executionProbe = RuntimeVerificationService.createProbe(appContext),
     )
 
     val crashHandler: CrashHandler = CrashHandler(database.crashReportDao(), paths)
@@ -140,6 +151,7 @@ class AppContainer(context: Context) {
         paths = paths,
         installationDao = database.installationDao(),
         runtimeDao = database.runtimeDao(),
+        runtimeManager = runtimeManager,
         authManager = authManager,
         offlineProfileManager = offlineProfileManager,
         accountSessionManager = accountSessionManager,

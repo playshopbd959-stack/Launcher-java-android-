@@ -82,6 +82,7 @@ fun HomeScreen(
     onSelectInstallation: (String) -> Unit,
     onOpenVersionCenter: () -> Unit,
     onOpenAccounts: () -> Unit,
+    onOpenRuntimeManager: () -> Unit = {},
     onCancelDownload: () -> Unit,
 ) {
     val selected = installations.firstOrNull { it.id == selectedInstallationId } ?: installations.firstOrNull()
@@ -207,7 +208,13 @@ fun HomeScreen(
                         if (latestVersions.snapshot.isNotBlank()) {
                             NoxerBadge("Snapshot ${latestVersions.snapshot}", NoxerCyan)
                         }
-                        NoxerBadge("${runtimes.count { it.isInstalled }} JREs", NoxerAmber)
+                        NoxerBadge(
+                            text = "${runtimes.count { it.isInstalled && it.isVerified }} JREs",
+                            accentColor = NoxerAmber,
+                            modifier = Modifier
+                                .clickable(onClick = onOpenRuntimeManager)
+                                .testTag("home_jre_badge"),
+                        )
                     }
                 }
             }
