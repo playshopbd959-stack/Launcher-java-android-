@@ -1,0 +1,6 @@
+{
+  "name": "Noxer Launcher",
+  "description": "Real Minecraft Java Edition launcher for Android with Mojang manifest integration, independent instances, download verification, Microsoft auth, mod loaders, and native OpenGL ES/JNI engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
