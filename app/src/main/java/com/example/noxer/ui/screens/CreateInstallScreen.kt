@@ -179,11 +179,13 @@ fun CreateInstallScreen(
                     colors = FilterChipDefaults.filterChipColors(selectedContainerColor = NoxerNeonRed, selectedLabelColor = Color.White),
                 )
                 runtimes.forEach { rt ->
+                    val statusSuffix = if (rt.isVerified) " • Verified" else " • Unverified"
                     FilterChip(
                         selected = selectedRuntimeId == rt.id,
                         onClick = { selectedRuntimeId = rt.id },
-                        label = { Text("Java ${rt.majorVersion} (${rt.abi})") },
+                        label = { Text("Java ${rt.majorVersion} (${rt.abi})$statusSuffix") },
                         colors = FilterChipDefaults.filterChipColors(selectedContainerColor = NoxerNeonRed, selectedLabelColor = Color.White),
+                        modifier = Modifier.testTag("install_runtime_chip_${rt.id}"),
                     )
                 }
             }

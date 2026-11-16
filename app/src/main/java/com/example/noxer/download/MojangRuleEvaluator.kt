@@ -1,12 +1,15 @@
 package com.example.noxer.download
 
 import com.example.noxer.core.NoxerPaths
+import com.example.noxer.runtime.AndroidAbiInfo
+import com.example.noxer.runtime.AndroidRuntimeVerifier
 import com.example.noxer.version.AssetIndexJson
 import com.example.noxer.version.DownloadArtifact
 import com.example.noxer.version.LibraryEntry
 import com.example.noxer.version.RuleEntry
 import com.example.noxer.version.VersionDetails
 import java.io.File
+import java.util.zip.ZipInputStream
 
 data class DownloadTask(
     val id: String,
@@ -31,6 +34,14 @@ enum class DownloadCategory {
 
 object MojangRuleEvaluator {
 
+    fun normalizeArchGroup(arch: String?): String = when (arch?.trim()?.lowercase()) {
+        "arm64", "aarch64", "arm64-v8a" -> "arm64"
+        "arm", "arm32", "armeabi", "armeabi-v7a" -> "arm32"
+        "x86_64", "amd64", "x64" -> "x86_64"
+        "x86", "i386", "i686" -> "x86"
+        else -> arch?.trim()?.lowercase().orEmpty()
+    }
+
     /**
      * Evaluates Mojang rules for an Android Linux host environment.
      * Minecraft Java desktop manifests target "linux", "windows", or "osx".
@@ -42,11 +53,12 @@ object MojangRuleEvaluator {
         hostArch: String = "arm64",
     ): Boolean {
         if (rules.isNullOrEmpty()) return true
+        val normalizedHost = normalizeArchGroup(hostArch)
         var allowed = false
         for (rule in rules) {
             val matchesOs = rule.os?.let { os ->
                 val nameMatches = os.name == null || os.name == "linux"
-                val archMatches = os.arch == null || os.arch == hostArch || (os.arch == "x86" && hostArch == "x86")
+                val archMatches = os.arch == null || normalizeArchGroup(os.arch) == normalizedHost
                 nameMatches && archMatches
             } ?: true
 
@@ -114,7 +126,7 @@ object MojangRuleEvaluator {
         for (lib in details.libraries) {
             if (!isAllowed(lib.rules, hostArch = hostArch)) continue
             resolveLibraryArtifact(lib, paths)?.let { tasks += it }
-            resolveNativeArtifact(lib, paths)?.let { tasks += it }
+            resolveNativeArtifact(lib, paths, hostArch)?.let { tasks += it }
         }
 
         // 4. Asset Index
@@ -178,9 +190,17 @@ object MojangRuleEvaluator {
         return null
     }
 
-    private fun resolveNativeArtifact(lib: LibraryEntry, paths: NoxerPaths): DownloadTask? {
+    private fun resolveNativeArtifact(
+        lib: LibraryEntry,
+        paths: NoxerPaths,
+        hostArch: String = "arm64",
+    ): DownloadTask? {
         val nativeClassifierKey = lib.natives?.get("linux") ?: return null
-        val resolvedKey = nativeClassifierKey.replace("\${arch}", "64")
+        val archBits = when (normalizeArchGroup(hostArch)) {
+            "arm32", "x86" -> "32"
+            else -> "64"
+        }
+        val resolvedKey = nativeClassifierKey.replace("\${arch}", archBits)
         val classifierArtifact: DownloadArtifact = lib.downloads?.classifiers?.get(resolvedKey) ?: return null
         val relPath = classifierArtifact.path ?: mavenCoordinateToPath("${lib.name}:$resolvedKey")
         return DownloadTask(
@@ -192,6 +212,64 @@ object MojangRuleEvaluator {
             expectedSize = classifierArtifact.size,
             category = DownloadCategory.NATIVE_LIBRARY,
         )
+    }
+
+    /**
+     * Extracts shared native libraries (.so) from version libraries cleanly while rejecting
+     * desktop Linux glibc binaries and mismatched architectures so Android Bionic APK bridges
+     * (libglfw.so, libGL.so) are never shadowed or broken on dlopen.
+     */
+    fun extractCompatibleNatives(
+        details: VersionDetails,
+        paths: NoxerPaths,
+        nativesDir: File,
+        abiInfo: AndroidAbiInfo,
+    ): Int {
+        nativesDir.mkdirs()
+        val bridgedNames = setOf("libglfw.so", "libgl.so", "libgl.so.1")
+        val canonicalRoot = nativesDir.canonicalFile
+        var keptCount = 0
+
+        val nativeArchives = buildList {
+            for (lib in details.libraries) {
+                if (!isAllowed(lib.rules, hostArch = abiInfo.primaryAbi)) continue
+                resolveNativeArtifact(lib, paths, abiInfo.primaryAbi)?.let { add(it.destination) }
+                if (lib.name.contains("natives", ignoreCase = true)) {
+                    resolveLibraryArtifact(lib, paths)?.let { add(it.destination) }
+                }
+            }
+        }.distinctBy { it.absolutePath }.filter { it.exists() }
+
+        for (jarFile in nativeArchives) {
+            runCatching {
+                ZipInputStream(jarFile.inputStream().buffered()).use { zis ->
+                    var entry = zis.nextEntry
+                    while (entry != null) {
+                        val name = entry.name
+                        if (!entry.isDirectory && (name.endsWith(".so") || name.contains(".so."))) {
+                            val baseName = File(name).name
+                            if (baseName.lowercase() !in bridgedNames) {
+                                val outFile = File(nativesDir, baseName).canonicalFile
+                                if (outFile.path.startsWith(canonicalRoot.path + File.separator)) {
+                                    outFile.outputStream().use { zis.copyTo(it) }
+                                    val elf = AndroidRuntimeVerifier.inspectElf(outFile)
+                                    val archOk = elf.isValidElf && elf.machineName == abiInfo.elfMachineName
+                                    if (!archOk || elf.hasGlibcDependencies) {
+                                        outFile.delete()
+                                    } else {
+                                        outFile.setExecutable(true, false)
+                                        keptCount++
+                                    }
+                                }
+                            }
+                        }
+                        zis.closeEntry()
+                        entry = zis.nextEntry
+                    }
+                }
+            }
+        }
+        return keptCount
     }
 
     fun collectClasspathFiles(details: VersionDetails, paths: NoxerPaths, hostArch: String = "arm64"): List<File> {

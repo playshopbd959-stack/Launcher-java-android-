@@ -187,10 +187,17 @@ fun SettingsScreen(
                                 }
                                 Text(rt.diagnosticMessage ?: rt.fullVersion, style = MaterialTheme.typography.labelSmall, color = NoxerTextSecondary)
                             }
-                            OutlinedButton(onClick = { onVerifyRuntime(rt) }, border = BorderStroke(1.dp, NoxerBorder)) {
+                            OutlinedButton(
+                                onClick = { onVerifyRuntime(rt) },
+                                border = BorderStroke(1.dp, NoxerBorder),
+                                modifier = Modifier.testTag("settings_verify_runtime_${rt.id}"),
+                            ) {
                                 Text("Verify", style = MaterialTheme.typography.labelSmall)
                             }
-                            IconButton(onClick = { onDeleteRuntime(rt) }) {
+                            IconButton(
+                                onClick = { onDeleteRuntime(rt) },
+                                modifier = Modifier.testTag("settings_delete_runtime_${rt.id}"),
+                            ) {
                                 Icon(Icons.Default.Delete, contentDescription = "Delete Runtime", tint = NoxerCrimsonGlow)
                             }
                         }

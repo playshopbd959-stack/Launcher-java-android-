@@ -44,7 +44,8 @@ class JavaRuntimeManager(
     private val availableBytesProvider: () -> Long = {
         runCatching {
             paths.runtimesDir.mkdirs()
-            StatFs(paths.runtimesDir.absolutePath).availableBytes
+            val stat = StatFs(paths.runtimesDir.absolutePath)
+            if (stat.blockCountLong == 0L && stat.availableBytes == 0L) Long.MAX_VALUE else stat.availableBytes
         }.getOrDefault(Long.MAX_VALUE)
     },
 ) {

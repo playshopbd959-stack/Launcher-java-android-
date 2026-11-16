@@ -1,3 +1,4 @@
+#include "noxer_egl_shared.h"
 #include <jni.h>
 #include <android/log.h>
 #include <android/native_window.h>
@@ -9,6 +10,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -27,6 +31,7 @@ struct EglContextState {
     EGLDisplay display = EGL_NO_DISPLAY;
     EGLSurface surface = EGL_NO_SURFACE;
     EGLContext context = EGL_NO_CONTEXT;
+    EGLConfig config = nullptr;
     int width = 0;
     int height = 0;
     std::string vendor;
@@ -45,6 +50,8 @@ struct InputEventItem {
 };
 
 std::mutex g_eglMutex;
+std::condition_variable g_windowCv;
+std::atomic<bool> g_gameOwnsEgl{false};
 EglContextState g_egl;
 
 std::mutex g_inputMutex;
@@ -124,6 +131,7 @@ void* pipeReaderThread(void* arg) {
 }
 
 void destroyEglLocked() {
+    g_gameOwnsEgl.store(false);
     if (g_egl.display != EGL_NO_DISPLAY) {
         eglMakeCurrent(g_egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (g_egl.context != EGL_NO_CONTEXT) {
@@ -140,12 +148,107 @@ void destroyEglLocked() {
     g_egl.display = EGL_NO_DISPLAY;
     g_egl.surface = EGL_NO_SURFACE;
     g_egl.context = EGL_NO_CONTEXT;
+    g_egl.config = nullptr;
     g_egl.window = nullptr;
     g_egl.width = 0;
     g_egl.height = 0;
 }
 
 } // namespace
+
+extern "C" {
+
+__attribute__((visibility("default"))) EGLDisplay noxerGetEglDisplay() {
+    std::lock_guard<std::mutex> lock(g_eglMutex);
+    return g_egl.display;
+}
+
+__attribute__((visibility("default"))) EGLSurface noxerGetEglSurface() {
+    std::lock_guard<std::mutex> lock(g_eglMutex);
+    return g_egl.surface;
+}
+
+__attribute__((visibility("default"))) EGLContext noxerGetEglContext() {
+    std::lock_guard<std::mutex> lock(g_eglMutex);
+    return g_egl.context;
+}
+
+__attribute__((visibility("default"))) EGLConfig noxerGetEglConfig() {
+    std::lock_guard<std::mutex> lock(g_eglMutex);
+    return g_egl.config;
+}
+
+__attribute__((visibility("default"))) ANativeWindow* noxerGetNativeWindow() {
+    std::lock_guard<std::mutex> lock(g_eglMutex);
+    return g_egl.window;
+}
+
+__attribute__((visibility("default"))) void noxerGetWindowSize(int* outW, int* outH) {
+    std::lock_guard<std::mutex> lock(g_eglMutex);
+    if (outW) *outW = g_egl.width;
+    if (outH) *outH = g_egl.height;
+}
+
+__attribute__((visibility("default"))) void noxerSetGameOwnsEgl(int owns) {
+    g_gameOwnsEgl.store(owns != 0);
+}
+
+__attribute__((visibility("default"))) int noxerIsGameOwnsEgl() {
+    return g_gameOwnsEgl.load() ? 1 : 0;
+}
+
+__attribute__((visibility("default"))) int noxerMakeEglCurrentOnCallingThread() {
+    std::lock_guard<std::mutex> lock(g_eglMutex);
+    if (g_egl.display == EGL_NO_DISPLAY || g_egl.surface == EGL_NO_SURFACE || g_egl.context == EGL_NO_CONTEXT) {
+        return 0;
+    }
+    return eglMakeCurrent(g_egl.display, g_egl.surface, g_egl.surface, g_egl.context) ? 1 : 0;
+}
+
+__attribute__((visibility("default"))) int noxerReleaseEglOnCallingThread() {
+    std::lock_guard<std::mutex> lock(g_eglMutex);
+    if (g_egl.display == EGL_NO_DISPLAY) return 1;
+    return eglMakeCurrent(g_egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) ? 1 : 0;
+}
+
+__attribute__((visibility("default"))) int noxerSwapBuffers() {
+    EGLDisplay dpy = EGL_NO_DISPLAY;
+    EGLSurface surf = EGL_NO_SURFACE;
+    {
+        std::lock_guard<std::mutex> lock(g_eglMutex);
+        dpy = g_egl.display;
+        surf = g_egl.surface;
+    }
+    if (dpy == EGL_NO_DISPLAY || surf == EGL_NO_SURFACE) return 0;
+    return eglSwapBuffers(dpy, surf) ? 1 : 0;
+}
+
+__attribute__((visibility("default"))) int noxerWaitForWindowReady(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(g_eglMutex);
+    if (g_egl.display != EGL_NO_DISPLAY && g_egl.surface != EGL_NO_SURFACE && g_egl.context != EGL_NO_CONTEXT) {
+        return 1;
+    }
+    return g_windowCv.wait_for(lock, std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 10000), [] {
+        return g_egl.display != EGL_NO_DISPLAY && g_egl.surface != EGL_NO_SURFACE && g_egl.context != EGL_NO_CONTEXT;
+    }) ? 1 : 0;
+}
+
+__attribute__((visibility("default"))) int noxerPopInputEvent(
+        int* outType, int* outCode, int* outAction, float* outX, float* outY, int* outModifiers) {
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    if (g_inputQueue.empty()) return 0;
+    InputEventItem item = g_inputQueue.front();
+    g_inputQueue.pop_front();
+    if (outType) *outType = item.type;
+    if (outCode) *outCode = item.code;
+    if (outAction) *outAction = item.action;
+    if (outX) *outX = item.x;
+    if (outY) *outY = item.y;
+    if (outModifiers) *outModifiers = item.modifiers;
+    return 1;
+}
+
+} // extern "C"
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     g_androidVm = vm;
@@ -291,6 +394,7 @@ Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeInitWindow(
     g_egl.display = display;
     g_egl.surface = eglSurface;
     g_egl.context = eglContext;
+    g_egl.config = config;
     g_egl.width = ANativeWindow_getWidth(window);
     g_egl.height = ANativeWindow_getHeight(window);
     const char* v = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
@@ -301,7 +405,14 @@ Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeInitWindow(
     g_egl.version = ver ? ver : "";
 
     glViewport(0, 0, g_egl.width, g_egl.height);
-    LOGI("EGL initialized %dx%d on %s", g_egl.width, g_egl.height, g_egl.renderer.c_str());
+    glClearColor(0.03f, 0.03f, 0.045f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    eglSwapBuffers(display, eglSurface);
+    // CRITICAL: release EGL context from Android UI thread so Minecraft render thread can bind cleanly
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+    g_windowCv.notify_all();
+    LOGI("EGL initialized %dx%d on %s (context released for JVM thread)", g_egl.width, g_egl.height, g_egl.renderer.c_str());
     return JNI_TRUE;
 }
 
@@ -311,22 +422,32 @@ Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeResizeWindow(
     std::lock_guard<std::mutex> lock(g_eglMutex);
     g_egl.width = width;
     g_egl.height = height;
-    if (g_egl.display != EGL_NO_DISPLAY && g_egl.surface != EGL_NO_SURFACE) {
-        eglMakeCurrent(g_egl.display, g_egl.surface, g_egl.surface, g_egl.context);
-        glViewport(0, 0, width, height);
+    if (!g_gameOwnsEgl.load() && g_egl.display != EGL_NO_DISPLAY && g_egl.surface != EGL_NO_SURFACE) {
+        if (eglMakeCurrent(g_egl.display, g_egl.surface, g_egl.surface, g_egl.context)) {
+            glViewport(0, 0, width, height);
+            eglMakeCurrent(g_egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        }
     }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeRenderHeartbeatFrame(
         JNIEnv*, jobject, jfloat pulse) {
+    if (g_gameOwnsEgl.load()) return;
     std::lock_guard<std::mutex> lock(g_eglMutex);
-    if (g_egl.display == EGL_NO_DISPLAY || g_egl.surface == EGL_NO_SURFACE) return;
-    eglMakeCurrent(g_egl.display, g_egl.surface, g_egl.surface, g_egl.context);
-    float red = 0.03f + 0.04f * pulse;
-    glClearColor(red, 0.03f, 0.045f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    eglSwapBuffers(g_egl.display, g_egl.surface);
+    if (g_gameOwnsEgl.load() || g_egl.display == EGL_NO_DISPLAY || g_egl.surface == EGL_NO_SURFACE) return;
+    if (eglMakeCurrent(g_egl.display, g_egl.surface, g_egl.surface, g_egl.context)) {
+        float red = 0.03f + 0.04f * pulse;
+        glClearColor(red, 0.03f, 0.045f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        eglSwapBuffers(g_egl.display, g_egl.surface);
+        eglMakeCurrent(g_egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_noxer_nativebridge_NoxerNativeBridge_nativeIsGameOwnsEgl(JNIEnv*, jobject) {
+    return g_gameOwnsEgl.load() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL

@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -104,6 +105,7 @@ fun JavaRuntimeManagerScreen(
             .background(NoxerBlack)
             .testTag("runtime_manager_list"),
         contentPadding = PaddingValues(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
@@ -138,7 +140,7 @@ fun JavaRuntimeManagerScreen(
 
         // Device ABI & ARM64 Compatibility Overview
         item {
-            NoxerPanel(highlighted = true) {
+            NoxerPanel(highlighted = true, modifier = Modifier.widthIn(max = 760.dp)) {
                 Text(
                     text = "ANDROID DEVICE ARCHITECTURE",
                     style = MaterialTheme.typography.labelMedium,
@@ -170,7 +172,7 @@ fun JavaRuntimeManagerScreen(
 
         // Install Java Panel
         item {
-            NoxerPanel {
+            NoxerPanel(modifier = Modifier.widthIn(max = 760.dp)) {
                 Text(
                     text = "INSTALL ANDROID JAVA RUNTIME",
                     style = MaterialTheme.typography.labelMedium,
@@ -324,7 +326,9 @@ fun JavaRuntimeManagerScreen(
 
                 NoxerPanel(
                     highlighted = rt.isDefault,
-                    modifier = Modifier.testTag("runtime_card_${rt.id}"),
+                    modifier = Modifier
+                        .widthIn(max = 760.dp)
+                        .testTag("runtime_card_${rt.id}"),
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),

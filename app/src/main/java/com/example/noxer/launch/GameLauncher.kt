@@ -15,6 +15,7 @@ import com.example.noxer.data.db.InstallationStatus
 import com.example.noxer.data.db.LoaderType
 import com.example.noxer.data.db.RuntimeDao
 import com.example.noxer.data.db.RuntimeEntity
+import com.example.noxer.download.DownloadCategory
 import com.example.noxer.download.DownloadEngine
 import com.example.noxer.download.MojangRuleEvaluator
 import com.example.noxer.graphics.RendererBackend
@@ -23,19 +24,27 @@ import com.example.noxer.mods.FabricProfileJson
 import com.example.noxer.mods.ModLoaderManager
 import com.example.noxer.nativebridge.NativeLogCallback
 import com.example.noxer.nativebridge.NoxerNativeBridge
+import com.example.noxer.runtime.AndroidAbiInfo
 import com.example.noxer.runtime.JavaRuntimeManager
+import com.example.noxer.version.AssetIndexJson
 import com.example.noxer.version.VersionCenterRepository
 import com.example.noxer.version.VersionDetails
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 
 data class LaunchPipelineState(
@@ -64,6 +73,25 @@ data class PreparedLaunchPlan(
     val jvmOptions: List<String>,
     val gameArgs: List<String>,
     val envVars: Map<String, String>,
+)
+
+@Serializable
+data class LaunchExecutionPlan(
+    val installationId: String,
+    val installationName: String,
+    val minecraftVersionId: String,
+    val gameDirPath: String,
+    val authModeLabel: String,
+    val runtimeId: String,
+    val runtimeMajorVersion: Int,
+    val runtimeAbi: String,
+    val libJvmPath: String,
+    val mainClass: String,
+    val jvmOptions: List<String>,
+    val gameArgs: List<String>,
+    val envVars: Map<String, String>,
+    val commandPreview: String,
+    val logFilePath: String,
 )
 
 fun interface JvmLauncherBackend {
@@ -178,7 +206,10 @@ class GameLauncher(
         step(1, "Validating installation '${install.name}'...", install.name)
 
         // Check storage space (> 64 MB free)
-        val freeBytes = runCatching { StatFs(paths.rootDir.absolutePath).availableBytes }.getOrDefault(Long.MAX_VALUE)
+        val freeBytes = runCatching {
+            val stat = StatFs(paths.rootDir.absolutePath)
+            if (stat.blockCountLong == 0L && stat.availableBytes == 0L) Long.MAX_VALUE else stat.availableBytes
+        }.getOrDefault(Long.MAX_VALUE)
         if (freeBytes < 64L * 1024L * 1024L) {
             fail(install, LaunchErrorCategory.INSUFFICIENT_STORAGE, "Less than 64 MB free internal storage remaining.")
             return
@@ -321,30 +352,173 @@ class GameLauncher(
         }
         _state.value = _state.value.copy(runtimeDownloadProgress = 0f, runtimeDownloadDetail = "")
 
-        // Step 4: Check game files
-        step(4, "Verifying client JAR & library SHA-1 integrity...")
-        val tasks = MojangRuleEvaluator.collectDownloadTasks(versionDetails, paths, assetIndex = null)
-        val integrity = downloadEngine.verifyIntegrity(tasks)
-        if (!integrity.isHealthy || install.status != InstallationStatus.READY.name) {
+        // Step 4 & 5: Verify & auto-repair game files, libraries, asset index & assets
+        step(4, "Verifying & repairing game files, libraries & assets...")
+        val baseTasks = MojangRuleEvaluator.collectDownloadTasks(
+            details = versionDetails,
+            paths = paths,
+            assetIndex = null,
+            hostArch = abiInfo.primaryAbi,
+        )
+        val indexTask = baseTasks.firstOrNull { it.category == DownloadCategory.ASSET_INDEX }
+        var resolvedAssetIndex: AssetIndexJson? = null
+        if (indexTask != null) {
+            val idxValid = indexTask.destination.exists() &&
+                DownloadEngine.verifyFileSha1AndSize(indexTask.destination, indexTask.expectedSha1, indexTask.expectedSize)
+            if (!idxValid) {
+                step(4, "Downloading Minecraft asset index (${indexTask.label})...", detail = indexTask.label, dlFrac = 0.05f)
+                val idxDl = downloadEngine.downloadAll("Fetching asset index", listOf(indexTask), concurrency = 1)
+                if (idxDl.isFailure) {
+                    val errMsg = idxDl.exceptionOrNull()?.message ?: "Unable to download asset index"
+                    fail(install, LaunchErrorCategory.CORRUPTED_FILES, "Asset index download failed: $errMsg")
+                    return
+                }
+            }
+            resolvedAssetIndex = runCatching {
+                json.decodeFromString(AssetIndexJson.serializer(), indexTask.destination.readText())
+            }.getOrElse {
+                fail(install, LaunchErrorCategory.CORRUPTED_FILES, "Corrupted asset index JSON: ${it.message}")
+                return
+            }
+        }
+
+        val allTasks = MojangRuleEvaluator.collectDownloadTasks(
+            details = versionDetails,
+            paths = paths,
+            assetIndex = resolvedAssetIndex,
+            hostArch = abiInfo.primaryAbi,
+        )
+        var integrity = downloadEngine.verifyIntegrity(allTasks)
+        val repairTasks = integrity.missingTasks + integrity.corruptedTasks
+        if (repairTasks.isNotEmpty()) {
+            consoleLogger.info(
+                "LaunchRepair",
+                "Auto-repairing ${integrity.missingTasks.size} missing and ${integrity.corruptedTasks.size} corrupted file(s) for '${install.name}'...",
+            )
+            step(
+                n = 4,
+                title = "Downloading ${repairTasks.size} missing/repaired game files...",
+                detail = "Starting verification repair (${repairTasks.size} files)...",
+                dlFrac = 0.02f,
+            )
+            val progressMirrorJob: Job = scope.launch {
+                while (isActive) {
+                    val dp = downloadEngine.progress.value
+                    if (dp.isActive) {
+                        _state.value = _state.value.copy(
+                            isLaunching = true,
+                            currentStep = 4,
+                            stepTitle = "Downloading ${repairTasks.size} game files (${dp.completedFiles}/${dp.totalFiles})...",
+                            runtimeDownloadProgress = dp.fraction,
+                            runtimeDownloadDetail = dp.currentFileLabel.ifBlank { dp.phaseLabel },
+                        )
+                    }
+                    delay(150L)
+                }
+            }
+            val repairResult = try {
+                downloadEngine.downloadAll(
+                    phaseLabel = "Repairing ${versionDetails.id}",
+                    tasks = repairTasks,
+                    concurrency = 6,
+                )
+            } finally {
+                progressMirrorJob.cancel()
+            }
+
+            if (repairResult.isFailure) {
+                val errMsg = repairResult.exceptionOrNull()?.message ?: "Download error"
+                integrity = downloadEngine.verifyIntegrity(allTasks)
+                installationDao.upsert(
+                    install.copy(
+                        status = InstallationStatus.CORRUPTED.name,
+                        lastError = errMsg,
+                        verifiedFileCount = integrity.validCount,
+                        totalFileCount = integrity.totalChecked,
+                    )
+                )
+                fail(
+                    install,
+                    LaunchErrorCategory.CORRUPTED_FILES,
+                    "Auto-repair could not fetch ${integrity.missingTasks.size} missing and ${integrity.corruptedTasks.size} corrupted files: $errMsg",
+                )
+                return
+            }
+            integrity = downloadEngine.verifyIntegrity(allTasks)
+        }
+
+        if (!integrity.isHealthy) {
+            installationDao.upsert(
+                install.copy(
+                    status = InstallationStatus.CORRUPTED.name,
+                    lastError = "${integrity.missingTasks.size} missing, ${integrity.corruptedTasks.size} corrupted",
+                    verifiedFileCount = integrity.validCount,
+                    totalFileCount = integrity.totalChecked,
+                )
+            )
             fail(
                 install,
                 LaunchErrorCategory.CORRUPTED_FILES,
-                "${integrity.missingTasks.size} missing and ${integrity.corruptedTasks.size} corrupted game files detected.",
+                "${integrity.missingTasks.size} missing and ${integrity.corruptedTasks.size} corrupted game files remain after repair.",
             )
             return
         }
 
-        // Step 5: Prepare assets
-        step(5, "Preparing Minecraft asset index (${versionDetails.assetIndex?.id ?: "legacy"})...")
+        val loaderType = runCatching { LoaderType.valueOf(install.loaderType) }.getOrDefault(LoaderType.VANILLA)
         val gameDir = File(install.gameDirPath).apply { mkdirs() }
+        if (loaderType == LoaderType.FABRIC && !install.loaderVersion.isNullOrBlank()) {
+            val fabricProfileFile = File(gameDir, "fabric-profile.json")
+            val needsFabricInstall = if (!fabricProfileFile.exists()) {
+                true
+            } else {
+                val parsed = runCatching { json.decodeFromString(FabricProfileJson.serializer(), fabricProfileFile.readText()) }.getOrNull()
+                parsed == null || parsed.libraries.any { !paths.libraryFile(MojangRuleEvaluator.mavenCoordinateToPath(it.name)).exists() }
+            }
+            if (needsFabricInstall) {
+                step(4, "Repairing Fabric Loader ${install.loaderVersion}...")
+                val fabricRes = modLoaderManager.installFabricProfile(install.id, versionDetails.id, install.loaderVersion)
+                if (fabricRes.isFailure) {
+                    fail(
+                        install,
+                        LaunchErrorCategory.MISSING_LIBRARIES,
+                        "Fabric profile setup failed: ${fabricRes.exceptionOrNull()?.message ?: "unknown"}",
+                    )
+                    return
+                }
+            }
+        }
+
+        // Heal installation metadata whenever verification passes cleanly
+        if (install.status != InstallationStatus.READY.name ||
+            install.lastError != null ||
+            install.verifiedFileCount != integrity.validCount ||
+            install.totalFileCount != integrity.totalChecked
+        ) {
+            install = install.copy(
+                status = InstallationStatus.READY.name,
+                lastError = null,
+                verifiedFileCount = integrity.validCount,
+                totalFileCount = integrity.totalChecked,
+            )
+            installationDao.upsert(install)
+        }
+        _state.value = _state.value.copy(runtimeDownloadProgress = 0f, runtimeDownloadDetail = "")
+
+        // Step 5: Asset check confirmation
+        step(5, "Assets ready (${resolvedAssetIndex?.objects?.size ?: 0} objects, ${integrity.validCount}/${integrity.totalChecked} verified)...")
         val nativesDir = File(gameDir, "natives").apply { mkdirs() }
 
-        // Step 6: Prepare native libraries
-        step(6, "Preparing JNI & native library paths...")
-        val modCheck = modLoaderManager.scanInstanceMods(
-            install.id,
-            runCatching { LoaderType.valueOf(install.loaderType) }.getOrDefault(LoaderType.VANILLA),
+        // Step 6: Prepare native libraries (Android Bionic ABI-safe extraction + mod validation)
+        step(6, "Extracting Android-compatible natives & checking mods...")
+        val extractedNativeCount = MojangRuleEvaluator.extractCompatibleNatives(
+            details = versionDetails,
+            paths = paths,
+            nativesDir = nativesDir,
+            abiInfo = abiInfo,
         )
+        consoleLogger.info("LaunchNatives", "Prepared $extractedNativeCount Android-compatible native library(s) in ${nativesDir.absolutePath}")
+
+        val modCheck = modLoaderManager.scanInstanceMods(install.id, loaderType)
         val modConflict = modCheck.firstOrNull { it.conflictWarning != null }
         if (modConflict != null) {
             fail(install, LaunchErrorCategory.INCOMPATIBLE_MODS, "${modConflict.displayName}: ${modConflict.conflictWarning}")
@@ -353,9 +527,12 @@ class GameLauncher(
 
         // Step 7: Generate classpath
         step(7, "Generating JVM classpath...")
-        val cpFiles = MojangRuleEvaluator.collectClasspathFiles(versionDetails, paths).toMutableList()
+        val cpFiles = MojangRuleEvaluator.collectClasspathFiles(
+            details = versionDetails,
+            paths = paths,
+            hostArch = abiInfo.primaryAbi,
+        ).toMutableList()
         var effectiveMainClass = versionDetails.mainClass
-        val loaderType = runCatching { LoaderType.valueOf(install.loaderType) }.getOrDefault(LoaderType.VANILLA)
         if (loaderType == LoaderType.FABRIC) {
             val fabricProfileFile = File(gameDir, "fabric-profile.json")
             if (fabricProfileFile.exists()) {
@@ -369,15 +546,18 @@ class GameLauncher(
         }
         val classpathStr = cpFiles.distinctBy { it.absolutePath }.joinToString(":") { it.absolutePath }
 
-        // Step 8: Generate JVM arguments compatible with Java 8 / 17 / 21 / 25+
+        // Step 8: Generate JVM arguments compatible with Java 8 / 17 / 21 / 25+ & Android Netty/LWJGL3
         step(8, "Building Java ${runtime.majorVersion} arguments (-Xmx${install.memoryMb}M)...")
         val runtimeEnv = runtimeManager.buildRuntimeEnvironment(runtime, nativesDir)
+        val appNativeLibDir = context.applicationInfo.nativeLibraryDir.orEmpty()
         val jvmOptions = buildCompatibleJvmOptions(
             install = install,
             runtime = runtime,
             classpathStr = classpathStr,
             nativesDir = nativesDir,
-            appNativeLibDir = context.applicationInfo.nativeLibraryDir.orEmpty(),
+            appNativeLibDir = appNativeLibDir,
+            details = versionDetails,
+            abiInfo = abiInfo,
         )
 
         // Step 9: Generate Minecraft game arguments
@@ -398,9 +578,18 @@ class GameLauncher(
         step(10, "Configuring ${install.rendererId} graphics & JAVA_HOME...")
         val backend = RendererBackend.entries.firstOrNull { it.id == install.rendererId } ?: RendererBackend.GL4ES_GLES3
         val envVars = rendererManager.getEnvironmentVariables(backend, install.resolutionScalePercent).toMutableMap()
+        val tmpDir = File(gameDir, "tmp").apply { mkdirs() }
         envVars["HOME"] = gameDir.absolutePath
+        envVars["TMPDIR"] = tmpDir.absolutePath
+        envVars["GLFW_LIBRARY_NAME"] = "glfw"
+        envVars["MESA_GLSL_VERSION_OVERRIDE"] = "330"
         envVars.putAll(runtimeEnv.envVars)
-        envVars.forEach { (k, v) -> NoxerNativeBridge.setEnv(k, v) }
+        val extraLibDirs = listOfNotNull(
+            appNativeLibDir.takeIf { it.isNotBlank() },
+            nativesDir.absolutePath,
+            envVars["LD_LIBRARY_PATH"]?.takeIf { it.isNotBlank() },
+        )
+        envVars["LD_LIBRARY_PATH"] = extraLibDirs.joinToString(":")
 
         val plan = PreparedLaunchPlan(
             installation = install,
@@ -417,19 +606,56 @@ class GameLauncher(
         _state.value = _state.value.copy(generatedCommandPreview = previewCmd)
         consoleLogger.debug("LaunchCmd", previewCmd)
 
-        // Step 11: Initialize rendering and input viewport
+        // Step 11: Persist launch plan & hand off to isolated :game SurfaceView activity on device
         step(11, "Opening EGL / OpenGL ES 3.0 viewport & input engine...")
         installationDao.upsert(install.copy(lastPlayedAt = System.currentTimeMillis()))
 
+        val gameLogFile = File(File(gameDir, "logs").apply { mkdirs() }, "noxer-game-latest.log")
+        val execPlan = LaunchExecutionPlan(
+            installationId = install.id,
+            installationName = install.name,
+            minecraftVersionId = install.minecraftVersionId,
+            gameDirPath = gameDir.absolutePath,
+            authModeLabel = authModeLabel,
+            runtimeId = runtime.id,
+            runtimeMajorVersion = runtime.majorVersion,
+            runtimeAbi = runtime.abi,
+            libJvmPath = runtime.libJvmPath,
+            mainClass = effectiveMainClass,
+            jvmOptions = jvmOptions,
+            gameArgs = gameArgs,
+            envVars = envVars,
+            commandPreview = previewCmd,
+            logFilePath = gameLogFile.absolutePath,
+        )
+
         if (startViewportActivity) {
+            val planFile = File(gameDir, "noxer-launch-plan.json")
+            planFile.writeText(json.encodeToString(LaunchExecutionPlan.serializer(), execPlan))
+
             val intent = Intent(context, GameViewportActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 putExtra(GameViewportActivity.EXTRA_INSTANCE_ID, install.id)
+                putExtra(GameViewportActivity.EXTRA_PLAN_PATH, planFile.absolutePath)
             }
             context.startActivity(intent)
+
+            // Transition main launcher dialog cleanly so GameViewportActivity (:game process) owns JVM + EGL
+            _state.value = LaunchPipelineState(
+                isLaunching = false,
+                currentStep = 13,
+                stepTitle = "Game viewport running (${runtime.abi})",
+                activeInstallationName = install.name,
+                activeInstallationId = install.id,
+                authModeLabel = authModeLabel,
+                generatedCommandPreview = previewCmd,
+                isGameSurfaceRunning = true,
+            )
+            return
         }
 
-        // Steps 12-16: Start JVM via JNI bridge, capture logs & handle exit/crash
+        // Direct in-process JVM execution path (used by deterministic unit / Robolectric tests)
+        envVars.forEach { (k, v) -> NoxerNativeBridge.setEnv(k, v) }
         step(12, "Starting Java ${runtime.majorVersion} VM (${runtime.abi})...")
         val jvmProbe = NoxerNativeBridge.probeLibJvm(runtime.libJvmPath)
         consoleLogger.info("JVM", "libjvm.so probe: $jvmProbe")
@@ -482,27 +708,75 @@ class GameLauncher(
         classpathStr: String,
         nativesDir: File,
         appNativeLibDir: String,
+        details: VersionDetails? = null,
+        abiInfo: AndroidAbiInfo? = null,
     ): List<String> {
+        val gameDir = File(install.gameDirPath)
+        val tmpDir = File(gameDir, "tmp").apply { mkdirs() }
+        val libDir = File(runtime.installPath, "lib")
+        val libPathParts = listOfNotNull(
+            appNativeLibDir.takeIf { it.isNotBlank() },
+            nativesDir.absolutePath,
+            libDir.takeIf { it.exists() }?.absolutePath,
+        )
+
         val jvmOptions = mutableListOf<String>()
         jvmOptions += "-Xms${(install.memoryMb / 2).coerceAtLeast(256)}M"
         jvmOptions += "-Xmx${install.memoryMb}M"
         jvmOptions += "-Djava.home=${runtime.installPath}"
         jvmOptions += "-Djava.class.path=$classpathStr"
-        val libPathParts = listOfNotNull(
-            nativesDir.absolutePath,
-            appNativeLibDir.takeIf { it.isNotBlank() },
-            File(runtime.installPath, "lib").takeIf { it.exists() }?.absolutePath,
-        )
         jvmOptions += "-Djava.library.path=${libPathParts.joinToString(":")}"
-        jvmOptions += "-Dorg.lwjgl.librarypath=${nativesDir.absolutePath}"
+        jvmOptions += "-Dorg.lwjgl.librarypath=${listOfNotNull(appNativeLibDir.takeIf { it.isNotBlank() }, nativesDir.absolutePath).joinToString(":")}"
+        jvmOptions += "-Dorg.lwjgl.system.SharedLibraryExtractPath=${nativesDir.absolutePath}"
+        jvmOptions += "-Dorg.lwjgl.opengl.libname=libGL.so"
+        jvmOptions += "-Dorg.lwjgl.glfw.libname=libglfw.so"
+        jvmOptions += "-Djava.io.tmpdir=${tmpDir.absolutePath}"
+        jvmOptions += "-Djna.tmpdir=${tmpDir.absolutePath}"
+        jvmOptions += "-Dio.netty.native.workdir=${tmpDir.absolutePath}"
+        jvmOptions += "-Dio.netty.transport.noNative=true"
+        jvmOptions += "-Djava.awt.headless=true"
         jvmOptions += "-Dos.name=Linux"
         jvmOptions += "-Duser.home=${install.gameDirPath}"
         jvmOptions += "-Dminecraft.launcher.brand=noxer-launcher"
         jvmOptions += "-Dminecraft.launcher.version=1.0.0"
 
+        details?.logging?.client?.file?.let { logCfg ->
+            val cfgFile = File(paths.loggingDir, logCfg.id)
+            if (cfgFile.exists()) {
+                jvmOptions += "-Dlog4j.configurationFile=${cfgFile.absolutePath}"
+            }
+        }
+
         if (runtime.majorVersion >= 17) {
             jvmOptions += "--add-opens=java.base/java.lang=ALL-UNNAMED"
             jvmOptions += "--add-opens=java.base/java.util=ALL-UNNAMED"
+        }
+
+        // Evaluate version-specific JVM flags cleanly (e.g. modern Minecraft module/GC flags)
+        val hostArch = abiInfo?.primaryAbi ?: "arm64"
+        details?.arguments?.jvm?.forEach { elem ->
+            when (elem) {
+                is JsonPrimitive -> if (elem.isString) {
+                    appendSafeVersionJvmArg(jvmOptions, elem.content, runtime.majorVersion, nativesDir)
+                }
+                is JsonObject -> {
+                    val rulesElem = elem["rules"]
+                    val rules = rulesElem?.let {
+                        runCatching { json.decodeFromJsonElement(kotlinx.serialization.builtins.ListSerializer(com.example.noxer.version.RuleEntry.serializer()), it) }.getOrNull()
+                    }
+                    if (MojangRuleEvaluator.isAllowed(rules, hostArch = hostArch)) {
+                        val valElem = elem["value"]
+                        when (valElem) {
+                            is JsonPrimitive -> if (valElem.isString) appendSafeVersionJvmArg(jvmOptions, valElem.content, runtime.majorVersion, nativesDir)
+                            is kotlinx.serialization.json.JsonArray -> valElem.forEach { item ->
+                                item.jsonPrimitive.contentOrNull?.let { appendSafeVersionJvmArg(jvmOptions, it, runtime.majorVersion, nativesDir) }
+                            }
+                            else -> Unit
+                        }
+                    }
+                }
+                else -> Unit
+            }
         }
 
         val rawCustom = install.jvmArgs.split(Regex("\\s+")).filter { it.isNotBlank() }
@@ -513,6 +787,31 @@ class GameLauncher(
             jvmOptions += arg
         }
         return jvmOptions.distinct()
+    }
+
+    private fun appendSafeVersionJvmArg(
+        target: MutableList<String>,
+        rawArg: String,
+        javaMajor: Int,
+        nativesDir: File,
+    ) {
+        val substituted = rawArg
+            .replace("\${natives_directory}", nativesDir.absolutePath)
+            .replace("\${launcher_name}", "noxer-launcher")
+            .replace("\${launcher_version}", "1.0.0")
+        if (substituted.isBlank() ||
+            substituted == "-cp" ||
+            substituted.contains("\${classpath}") ||
+            substituted.startsWith("-Djava.library.path=") ||
+            substituted == "-XstartOnFirstThread" ||
+            substituted.startsWith("-Dminecraft.launcher.")
+        ) {
+            return
+        }
+        if (javaMajor <= 8 && (substituted.startsWith("--add-opens") || substituted.startsWith("--add-exports"))) {
+            return
+        }
+        target += substituted
     }
 
     fun buildGameArguments(

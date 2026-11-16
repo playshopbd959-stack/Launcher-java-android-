@@ -38,6 +38,7 @@
             android:name=".noxer.launch.GameViewportActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation"
             android:exported="false"
+            android:process=":game"
             android:screenOrientation="sensorLandscape"
             android:theme="@style/Theme.NoxerLauncher" />
 

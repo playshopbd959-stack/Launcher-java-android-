@@ -13,11 +13,13 @@ import com.example.noxer.data.db.InstallationEntity
 import com.example.noxer.data.db.InstallationStatus
 import com.example.noxer.data.db.NoxerDatabase
 import com.example.noxer.download.DownloadEngine
+import com.example.noxer.download.MojangRuleEvaluator
 import com.example.noxer.graphics.RendererManager
 import com.example.noxer.launch.CrashHandler
 import com.example.noxer.launch.GameLauncher
 import com.example.noxer.launch.JvmLauncherBackend
 import com.example.noxer.launch.LaunchErrorCategory
+import com.example.noxer.launch.LaunchExecutionPlan
 import com.example.noxer.mods.ModLoaderManager
 import com.example.noxer.runtime.AndroidAbiInfo
 import com.example.noxer.runtime.AndroidRuntimeSourceResolver
@@ -30,8 +32,13 @@ import com.example.noxer.runtime.RuntimeInstallProgress
 import com.example.noxer.runtime.RuntimeRepositoryEndpoints
 import com.example.noxer.runtime.RuntimeSourceResolver
 import com.example.noxer.settings.SettingsManager
+import com.example.noxer.version.AssetIndexInfo
 import com.example.noxer.version.DownloadArtifact
 import com.example.noxer.version.JavaVersionInfo
+import com.example.noxer.version.LibraryDownloads
+import com.example.noxer.version.LibraryEntry
+import com.example.noxer.version.OsRule
+import com.example.noxer.version.RuleEntry
 import com.example.noxer.version.VersionCenterRepository
 import com.example.noxer.version.VersionDetails
 import com.example.noxer.version.VersionDownloads
@@ -39,6 +46,8 @@ import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import okhttp3.OkHttpClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -462,12 +471,12 @@ class JavaRuntimeEngineTest {
 
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         val port = server.address.port
-        var rangeHeaderSeen = false
+        val rangeHeaderSeen = java.util.concurrent.atomic.AtomicBoolean(false)
         try {
             server.createContext("/jre21-arm64.tar.gz") { ex ->
                 val range = ex.requestHeaders.getFirst("Range")
                 if (range != null && range.startsWith("bytes=")) {
-                    rangeHeaderSeen = true
+                    rangeHeaderSeen.set(true)
                     val start = range.removePrefix("bytes=").substringBefore("-").toIntOrNull() ?: 0
                     val slice = archiveBytes.copyOfRange(start, archiveBytes.size)
                     ex.responseHeaders.add("Content-Range", "bytes $start-${archiveBytes.size - 1}/${archiveBytes.size}")
@@ -602,7 +611,10 @@ class JavaRuntimeEngineTest {
             // Press PLAY -> must autonomously install, verify, assign Java 21, and continue launch!
             launcher.executePipeline(inst.id)
 
-            assertTrue("Resumable HTTP Range should have been used", rangeHeaderSeen)
+            assertTrue(
+                "Resumable HTTP Range should have been used (error=${launcher.state.value.errorMessage})",
+                rangeHeaderSeen.get(),
+            )
             val installedJava21 = db.runtimeDao().getVerifiedByMajorVersion(21)
             assertNotNull("Java 21 must be registered and verified", installedJava21)
             assertTrue(installedJava21!!.isInstalled)
@@ -677,5 +689,238 @@ class JavaRuntimeEngineTest {
         assertTrue("Broken/failed install must never be stored in RuntimeDao", db.runtimeDao().getAll().isEmpty())
         assertTrue("Version 1.21.11 infers Java 21", VersionCenterRepository.inferRequiredJavaMajor("1.21.11", null) == 21)
         db.close()
+    }
+
+    @Test
+    fun playAutoRepairsNonReadyInstallationAndConfiguresAndroidNettyAndBionicNatives() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, NoxerDatabase::class.java).allowMainThreadQueries().build()
+        val paths = NoxerPaths(context)
+        val logger = ConsoleLogger(db.consoleLogDao(), paths)
+        val okHttp = OkHttpClient()
+
+        // Rule evaluation normalization check for aarch64 / arm64 / arm64-v8a
+        assertTrue(
+            MojangRuleEvaluator.isAllowed(
+                rules = listOf(RuleEntry(action = "allow", os = OsRule(name = "linux", arch = "aarch64"))),
+                hostArch = "arm64-v8a",
+            )
+        )
+        assertFalse(
+            MojangRuleEvaluator.isAllowed(
+                rules = listOf(RuleEntry(action = "allow", os = OsRule(name = "linux", arch = "x86_64"))),
+                hostArch = "arm64-v8a",
+            )
+        )
+
+        val mcVersion = "26.3"
+        val clientJarBytes = "PK\u0003\u0004minecraft-26.3-jar".toByteArray()
+        val clientSha1 = sha1Hex(clientJarBytes)
+        val assetIndexBytes = """{"objects":{}}""".toByteArray()
+        val assetIndexSha1 = sha1Hex(assetIndexBytes)
+
+        // Pre-seed cached valid client.jar (0 missing base JARs) while install status is DOWNLOADING (reproducing screenshot bug!)
+        val clientJarFile = paths.versionJarFile(mcVersion).apply {
+            parentFile?.mkdirs()
+            writeBytes(clientJarBytes)
+        }
+
+        // Build a mixed natives JAR containing 1 glibc desktop lib (must be rejected), 1 libglfw.so (must NOT shadow APK bridge), and 1 valid Bionic AArch64 .so (must be kept)
+        val nativesJarBaos = ByteArrayOutputStream()
+        ZipOutputStream(nativesJarBaos).use { zos ->
+            zos.putNextEntry(ZipEntry("libopenal.so"))
+            zos.write(buildTestElf64(0xB7, neededLibs = listOf("libc.so", "libm.so")))
+            zos.closeEntry()
+
+            zos.putNextEntry(ZipEntry("libdesktop_bad.so"))
+            zos.write(buildTestElf64(0xB7, neededLibs = listOf("libc.so.6")))
+            zos.closeEntry()
+
+            zos.putNextEntry(ZipEntry("libglfw.so"))
+            zos.write(buildTestElf64(0xB7, neededLibs = listOf("libc.so")))
+            zos.closeEntry()
+        }
+        val nativesJarBytes = nativesJarBaos.toByteArray()
+        val nativesJarSha1 = sha1Hex(nativesJarBytes)
+
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val port = server.address.port
+        try {
+            server.createContext("/indexes/26.json") { ex ->
+                ex.sendResponseHeaders(200, assetIndexBytes.size.toLong())
+                ex.responseBody.use { it.write(assetIndexBytes) }
+            }
+            server.createContext("/lwjgl-natives.jar") { ex ->
+                ex.sendResponseHeaders(200, nativesJarBytes.size.toLong())
+                ex.responseBody.use { it.write(nativesJarBytes) }
+            }
+            server.start()
+
+            // Register verified Java 25 runtime on disk
+            val rtDir = paths.runtimeDir("android-openjdk-25-arm64-v8a").apply { mkdirs() }
+            File(rtDir, "lib/server").mkdirs()
+            val libJvm = File(rtDir, "lib/server/libjvm.so").apply {
+                writeBytes(buildTestElf64(0xB7, neededLibs = listOf("libc.so", "libdl.so")))
+            }
+            db.runtimeDao().upsert(
+                com.example.noxer.data.db.RuntimeEntity(
+                    id = "android-openjdk-25-arm64-v8a",
+                    displayName = "Android OpenJDK 25 (arm64-v8a)",
+                    majorVersion = 25,
+                    fullVersion = "25.0.0",
+                    abi = "arm64-v8a",
+                    installPath = rtDir.absolutePath,
+                    libJvmPath = libJvm.absolutePath,
+                    javaBinPath = "",
+                    sourceProvider = "TestRepo",
+                    isDefault = true,
+                    sha256 = "0".repeat(64),
+                    sizeBytes = 1024L,
+                    downloadUrl = "http://127.0.0.1:$port/rt.tar.gz",
+                    isInstalled = true,
+                    isVerified = true,
+                    diagnosticMessage = "OK",
+                )
+            )
+
+            val details = VersionDetails(
+                id = mcVersion,
+                type = "release",
+                mainClass = "net.minecraft.client.main.Main",
+                javaVersion = JavaVersionInfo(component = "java-runtime-gamma", majorVersion = 25),
+                assetIndex = AssetIndexInfo(
+                    id = "26",
+                    sha1 = assetIndexSha1,
+                    size = assetIndexBytes.size.toLong(),
+                    url = "http://127.0.0.1:$port/indexes/26.json",
+                ),
+                downloads = VersionDownloads(
+                    client = DownloadArtifact(
+                        sha1 = clientSha1,
+                        size = clientJarBytes.size.toLong(),
+                        url = "http://127.0.0.1:$port/client.jar",
+                    )
+                ),
+                libraries = listOf(
+                    LibraryEntry(
+                        name = "org.lwjgl:lwjgl:3.3.3:natives-linux",
+                        downloads = LibraryDownloads(
+                            artifact = DownloadArtifact(
+                                path = "org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-linux.jar",
+                                sha1 = nativesJarSha1,
+                                size = nativesJarBytes.size.toLong(),
+                                url = "http://127.0.0.1:$port/lwjgl-natives.jar",
+                            )
+                        ),
+                    )
+                ),
+            )
+            paths.versionJsonFile(mcVersion).apply {
+                parentFile?.mkdirs()
+                writeText(json.encodeToString(VersionDetails.serializer(), details))
+            }
+
+            val settingsManager = SettingsManager(context)
+            val offlineManager = OfflineProfileManager(db.offlineProfileDao(), logger)
+            val profile = offlineManager.createProfile("NoxerPlayer", "Player", OfflineProfileIcon.SHIELD.id, "").getOrThrow()
+            val authManager = MicrosoftAuthManager(okHttp, json, db.accountDao(), logger)
+            val sessionManager = AccountSessionManager(authManager, offlineManager, settingsManager, logger)
+            sessionManager.selectOfflineProfile(profile.id)
+
+            val gameDir = paths.instanceGameDir("mc_26_3")
+            val inst = InstallationEntity(
+                id = "inst_26_3",
+                name = "Minecraft 26.3",
+                minecraftVersionId = mcVersion,
+                javaRuntimeId = "android-openjdk-25-arm64-v8a",
+                gameDirPath = gameDir.absolutePath,
+                status = InstallationStatus.DOWNLOADING.name,
+            )
+            db.installationDao().upsert(inst)
+
+            val arm64Abi = AndroidRuntimeSourceResolver.detectDeviceAbiInfo(listOf("arm64-v8a"))
+            val runtimeManager = JavaRuntimeManager(
+                okHttpClient = okHttp,
+                json = json,
+                runtimeDao = db.runtimeDao(),
+                paths = paths,
+                consoleLogger = logger,
+                installationDao = db.installationDao(),
+                sourceResolver = object : RuntimeSourceResolver {
+                    override fun detectAbiInfo() = arm64Abi
+                    override suspend fun resolvePackages(majorVersion: Int, abi: AndroidAbiInfo) = emptyList<com.example.noxer.runtime.ResolvedRuntimePackage>()
+                },
+            )
+
+            var launchedOpts: List<String> = emptyList()
+            val launcher = GameLauncher(
+                context = context,
+                paths = paths,
+                installationDao = db.installationDao(),
+                runtimeDao = db.runtimeDao(),
+                runtimeManager = runtimeManager,
+                authManager = authManager,
+                offlineProfileManager = offlineManager,
+                accountSessionManager = sessionManager,
+                downloadEngine = DownloadEngine(okHttp, logger),
+                modLoaderManager = ModLoaderManager(okHttp, json, paths, DownloadEngine(okHttp, logger), logger),
+                rendererManager = RendererManager(context),
+                crashHandler = CrashHandler(db.crashReportDao(), paths),
+                consoleLogger = logger,
+                json = json,
+                jvmBackend = JvmLauncherBackend { _, opts, _, _, _ ->
+                    launchedOpts = opts.toList()
+                    0
+                },
+                startViewportActivity = false,
+            )
+
+            launcher.executePipeline(inst.id)
+
+            assertNull("Should auto-repair & launch without '0 missing and 0 corrupted' failure", launcher.state.value.errorMessage)
+            assertEquals("Session ended cleanly (exit 0)", launcher.state.value.stepTitle)
+
+            val healedInst = db.installationDao().getById(inst.id)!!
+            assertEquals(InstallationStatus.READY.name, healedInst.status)
+
+            // Verify natives extraction filtered out glibc & libglfw.so while keeping valid Bionic libopenal.so
+            val nativesDir = File(gameDir, "natives")
+            assertTrue(File(nativesDir, "libopenal.so").exists())
+            assertFalse(File(nativesDir, "libdesktop_bad.so").exists())
+            assertFalse(File(nativesDir, "libglfw.so").exists())
+
+            // Verify critical Android LWJGL + Netty NIO multiplayer flags are configured
+            assertTrue(launchedOpts.contains("-Dio.netty.transport.noNative=true"))
+            assertTrue(launchedOpts.contains("-Dorg.lwjgl.opengl.libname=libGL.so"))
+            assertTrue(launchedOpts.contains("-Dorg.lwjgl.glfw.libname=libglfw.so"))
+            assertTrue(launchedOpts.any { it.startsWith("-Djava.io.tmpdir=") })
+
+            // Verify LaunchExecutionPlan JSON roundtrip
+            val samplePlan = LaunchExecutionPlan(
+                installationId = inst.id,
+                installationName = inst.name,
+                minecraftVersionId = mcVersion,
+                gameDirPath = gameDir.absolutePath,
+                authModeLabel = "OFFLINE",
+                runtimeId = "android-openjdk-25-arm64-v8a",
+                runtimeMajorVersion = 25,
+                runtimeAbi = "arm64-v8a",
+                libJvmPath = libJvm.absolutePath,
+                mainClass = "net.minecraft.client.main.Main",
+                jvmOptions = launchedOpts,
+                gameArgs = listOf("--username", "NoxerPlayer"),
+                envVars = mapOf("JAVA_HOME" to rtDir.absolutePath),
+                commandPreview = "preview",
+                logFilePath = File(gameDir, "logs/noxer-game-latest.log").absolutePath,
+            )
+            val encoded = json.encodeToString(LaunchExecutionPlan.serializer(), samplePlan)
+            val decoded = json.decodeFromString(LaunchExecutionPlan.serializer(), encoded)
+            assertEquals(samplePlan, decoded)
+
+            clientJarFile.delete()
+        } finally {
+            server.stop(0)
+            db.close()
+        }
     }
 }

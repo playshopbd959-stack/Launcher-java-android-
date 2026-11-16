@@ -2,13 +2,13 @@ package com.example.noxer.launch
 
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.Choreographer
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -44,11 +44,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -65,8 +64,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.noxer.NoxerApplication
+import com.example.noxer.core.AppContainer
 import com.example.noxer.input.InputManager
 import com.example.noxer.input.TouchButtonConfig
+import com.example.noxer.nativebridge.NativeLogCallback
 import com.example.noxer.nativebridge.NoxerNativeBridge
 import com.example.ui.theme.NoxerBlack
 import com.example.ui.theme.NoxerBorder
@@ -77,16 +78,44 @@ import com.example.ui.theme.NoxerNeonRed
 import com.example.ui.theme.NoxerSurface
 import com.example.ui.theme.NoxerTextPrimary
 import com.example.ui.theme.NoxerTextSecondary
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import java.io.File
+import java.io.FileWriter
+import java.io.PrintWriter
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class GameViewportActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_INSTANCE_ID = "instance_id"
+        const val EXTRA_PLAN_PATH = "plan_path"
+        private const val TAG = "NoxerGameViewport"
     }
 
     private var surfaceViewRef: SurfaceView? = null
     private var pointerCaptured by mutableStateOf(false)
+    private val jvmStarted = AtomicBoolean(false)
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private var activePlan: LaunchExecutionPlan? = null
+    private var isBootingJvm by mutableStateOf(true)
+    private var gameOwnsEgl by mutableStateOf(false)
+    private var statusMessage by mutableStateOf("Initializing EGL / OpenGL ES 3.0 viewport...")
+    private var errorTitle by mutableStateOf<String?>(null)
+    private var errorMessage by mutableStateOf<String?>(null)
+    private var recoveryHint by mutableStateOf<String?>(null)
+    private val liveLogLines = mutableStateListOf<String>()
+
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+    private var touchDownX = 0f
+    private var touchDownY = 0f
+    private var touchDragged = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -94,13 +123,25 @@ class GameViewportActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val container = (application as NoxerApplication).container
-        val instanceId = intent.getStringExtra(EXTRA_INSTANCE_ID).orEmpty()
+        val planPath = intent.getStringExtra(EXTRA_PLAN_PATH).orEmpty()
+        activePlan = if (planPath.isNotBlank() && File(planPath).exists()) {
+            runCatching {
+                container.json.decodeFromString(LaunchExecutionPlan.serializer(), File(planPath).readText())
+            }.getOrNull()
+        } else null
+
+        if (activePlan == null) {
+            isBootingJvm = false
+            errorTitle = "Missing Launch Execution Plan"
+            errorMessage = "Unable to load game launch configuration ($planPath)."
+            recoveryHint = "Return to launcher and press PLAY again."
+        } else {
+            appendLog("[Viewport] Loaded ${activePlan!!.installationName} (MC ${activePlan!!.minecraftVersionId}, Java ${activePlan!!.runtimeMajorVersion} ${activePlan!!.runtimeAbi})", false)
+        }
 
         setContent {
             NoxerLauncherTheme {
-                val launchState by container.gameLauncher.state.collectAsStateWithLifecycle()
                 val metrics by container.rendererManager.metrics.collectAsStateWithLifecycle()
-                val logs by container.consoleLogger.logs.collectAsStateWithLifecycle(initialValue = emptyList())
                 val profiles by container.inputManager.profiles.collectAsStateWithLifecycle(initialValue = emptyList())
 
                 var showConsole by remember { mutableStateOf(false) }
@@ -112,7 +153,7 @@ class GameViewportActivity : ComponentActivity() {
                     )
                 }
 
-                // Real Choreographer frame-time & FPS callback
+                // Real Choreographer heartbeat while awaiting LWJGL context ownership
                 var measuredFps by remember { mutableIntStateOf(0) }
                 DisposableEffect(Unit) {
                     val choreographer = Choreographer.getInstance()
@@ -124,9 +165,17 @@ class GameViewportActivity : ComponentActivity() {
                             frameCount++
                             val frameMs = (frameTimeNanos - lastFrameNs) / 1_000_000f
                             lastFrameNs = frameTimeNanos
-                            val pulse = ((frameTimeNanos / 1_000_000_000.0) % 2.0).toFloat()
-                            val normPulse = if (pulse > 1f) 2f - pulse else pulse
-                            NoxerNativeBridge.renderHeartbeatFrame(normPulse)
+
+                            val owns = NoxerNativeBridge.isGameOwnsEgl()
+                            if (owns != gameOwnsEgl) {
+                                gameOwnsEgl = owns
+                                if (owns) isBootingJvm = false
+                            }
+                            if (!owns && errorMessage == null) {
+                                val pulse = ((frameTimeNanos / 1_000_000_000.0) % 2.0).toFloat()
+                                val normPulse = if (pulse > 1f) 2f - pulse else pulse
+                                NoxerNativeBridge.renderHeartbeatFrame(normPulse)
+                            }
 
                             val elapsed = frameTimeNanos - windowStartNs
                             if (elapsed >= 1_000_000_000L) {
@@ -134,7 +183,7 @@ class GameViewportActivity : ComponentActivity() {
                                 container.rendererManager.updateFrameMetrics(
                                     fps = frameCount,
                                     frameTimeMs = frameMs,
-                                    processStatus = if (launchState.isLaunching) launchState.stepTitle else "Viewport Active",
+                                    processStatus = if (owns) "Minecraft Active" else statusMessage,
                                 )
                                 frameCount = 0
                                 windowStartNs = frameTimeNanos
@@ -147,7 +196,7 @@ class GameViewportActivity : ComponentActivity() {
                 }
 
                 Box(modifier = Modifier.fillMaxSize().background(NoxerBlack)) {
-                    // Real EGL / OpenGL ES 3.0 SurfaceView bound to libnoxer_native.so
+                    // Real EGL / OpenGL ES 3.0 SurfaceView bound to libnoxer_native.so + libglfw.so + libGL.so
                     AndroidView(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
@@ -156,7 +205,16 @@ class GameViewportActivity : ComponentActivity() {
                                 isFocusableInTouchMode = true
                                 holder.addCallback(object : SurfaceHolder.Callback {
                                     override fun surfaceCreated(holder: SurfaceHolder) {
-                                        NoxerNativeBridge.initWindow(holder.surface)
+                                        val ok = NoxerNativeBridge.initWindow(holder.surface)
+                                        if (ok) {
+                                            appendLog("[EGL] Window surface & GLES3 context initialized.", false)
+                                            maybeStartJvm(container)
+                                        } else {
+                                            isBootingJvm = false
+                                            errorTitle = "EGL Surface Error"
+                                            errorMessage = "Native EGL window creation failed on this device."
+                                            recoveryHint = "Check Settings -> Renderer backend or device GPU drivers."
+                                        }
                                     }
 
                                     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -167,6 +225,14 @@ class GameViewportActivity : ComponentActivity() {
                                         NoxerNativeBridge.destroyWindow()
                                     }
                                 })
+                                setOnTouchListener { _, event ->
+                                    if (!editTouchLayout && !pointerCaptured) {
+                                        handleSurfaceTouch(event, container.inputManager)
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                     setOnCapturedPointerListener { _, event ->
                                         handleMouseMotion(event, container.inputManager)
@@ -217,7 +283,7 @@ class GameViewportActivity : ComponentActivity() {
                                     color = NoxerNeonRed,
                                 )
                                 Text(
-                                    text = "$measuredFps FPS • ${metrics.javaHeapUsedMb}/${metrics.javaHeapMaxMb} MB Heap • ${NoxerNativeBridge.getPendingInputCount()} queued inputs",
+                                    text = "$measuredFps FPS • ${metrics.javaHeapUsedMb}/${metrics.javaHeapMaxMb} MB Heap • ${if (gameOwnsEgl) "GLES3 Live" else "Booting JVM"}",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = NoxerTextPrimary,
                                 )
@@ -263,7 +329,7 @@ class GameViewportActivity : ComponentActivity() {
                                 Icon(Icons.Default.Terminal, contentDescription = "Toggle Console", tint = NoxerTextPrimary)
                             }
                             IconButton(
-                                onClick = { finish() },
+                                onClick = { finishAndTerminateGameProcess() },
                                 modifier = Modifier
                                     .background(NoxerNeonRed.copy(alpha = 0.9f), RoundedCornerShape(8.dp))
                                     .testTag("viewport_exit_button"),
@@ -273,8 +339,8 @@ class GameViewportActivity : ComponentActivity() {
                         }
                     }
 
-                    // Launch Status / Blocker Diagnostic Card when JVM exits or encounters linker/native error
-                    if (launchState.errorMessage != null || launchState.isLaunching) {
+                    // Booting or JVM Exit Error Card (auto-hides as soon as Minecraft claims EGL context)
+                    if (errorMessage != null || (isBootingJvm && !gameOwnsEgl)) {
                         Surface(
                             modifier = Modifier
                                 .align(Alignment.Center)
@@ -284,34 +350,41 @@ class GameViewportActivity : ComponentActivity() {
                             shape = RoundedCornerShape(16.dp),
                             border = androidx.compose.foundation.BorderStroke(
                                 1.dp,
-                                if (launchState.errorMessage != null) NoxerNeonRed else NoxerBorder,
+                                if (errorMessage != null) NoxerNeonRed else NoxerBorder,
                             ),
                         ) {
                             Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text(
-                                    text = launchState.errorCategory?.title ?: launchState.stepTitle,
+                                    text = errorTitle ?: "Starting ${activePlan?.installationName ?: "Minecraft"}",
                                     style = MaterialTheme.typography.titleLarge,
-                                    color = if (launchState.errorMessage != null) NoxerCrimsonGlow else NoxerEmerald,
+                                    color = if (errorMessage != null) NoxerCrimsonGlow else NoxerEmerald,
                                 )
                                 Text(
-                                    text = launchState.errorMessage ?: "Step ${launchState.currentStep}/${launchState.totalSteps}: ${launchState.stepTitle}",
+                                    text = errorMessage ?: statusMessage,
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = NoxerTextPrimary,
                                 )
-                                launchState.recoveryAction?.let { rec ->
+                                activePlan?.authModeLabel?.takeIf { it.isNotBlank() }?.let { authLabel ->
+                                    Text(
+                                        text = authLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = NoxerTextSecondary,
+                                    )
+                                }
+                                recoveryHint?.let { rec ->
                                     Text(
                                         text = "Recovery: $rec",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = NoxerTextSecondary,
                                     )
                                 }
-                                if (launchState.errorMessage != null) {
+                                if (errorMessage != null) {
                                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                         Button(onClick = { showConsole = true }) {
                                             Text("Inspect Logs")
                                         }
                                         Button(
-                                            onClick = { finish() },
+                                            onClick = { finishAndTerminateGameProcess() },
                                             colors = ButtonDefaults.buttonColors(containerColor = NoxerNeonRed),
                                         ) {
                                             Text("Return to Launcher")
@@ -335,11 +408,15 @@ class GameViewportActivity : ComponentActivity() {
                             border = androidx.compose.foundation.BorderStroke(1.dp, NoxerBorder),
                         ) {
                             LazyColumn(modifier = Modifier.padding(10.dp), reverseLayout = true) {
-                                items(logs.take(80)) { log ->
+                                items(liveLogLines.take(120)) { line ->
                                     Text(
-                                        text = "[${log.level}/${log.source}] ${log.message}",
+                                        text = line,
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = if (log.level == "ERROR") NoxerCrimsonGlow else NoxerTextSecondary,
+                                        color = if (line.contains("[ERR]") || line.contains("Exception", ignoreCase = true)) {
+                                            NoxerCrimsonGlow
+                                        } else {
+                                            NoxerTextSecondary
+                                        },
                                     )
                                 }
                             }
@@ -348,6 +425,142 @@ class GameViewportActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun maybeStartJvm(container: AppContainer) {
+        val plan = activePlan ?: return
+        if (!jvmStarted.compareAndSet(false, true)) return
+
+        statusMessage = "Starting Java ${plan.runtimeMajorVersion} VM (${plan.runtimeAbi})..."
+        val logWriter = runCatching {
+            val logFile = File(plan.logFilePath)
+            logFile.parentFile?.mkdirs()
+            PrintWriter(FileWriter(logFile, false), true)
+        }.getOrNull()
+
+        Thread({
+            try {
+                plan.envVars.forEach { (k, v) -> NoxerNativeBridge.setEnv(k, v) }
+                val probe = NoxerNativeBridge.probeLibJvm(plan.libJvmPath)
+                val probeLine = "[JVM] libjvm.so probe: $probe"
+                appendLog(probeLine, false)
+                logWriter?.println(probeLine)
+
+                runOnUiThread {
+                    statusMessage = "Executing ${plan.mainClass} (Minecraft ${plan.minecraftVersionId})..."
+                }
+
+                val captured = mutableListOf<String>()
+                val exitCode = NoxerNativeBridge.launchJvm(
+                    libJvmPath = plan.libJvmPath,
+                    jvmOptions = plan.jvmOptions.toTypedArray(),
+                    mainClass = plan.mainClass,
+                    gameArgs = plan.gameArgs.toTypedArray(),
+                    callback = object : NativeLogCallback {
+                        override fun onLogLine(line: String, isError: Boolean) {
+                            val tagLine = if (isError) "[ERR] $line" else line
+                            synchronized(captured) {
+                                if (captured.size > 400) captured.removeAt(0)
+                                captured += tagLine
+                            }
+                            logWriter?.println(tagLine)
+                            appendLog(tagLine, isError)
+                        }
+                    },
+                )
+
+                logWriter?.flush()
+                logWriter?.close()
+
+                if (exitCode != 0) {
+                    val cat = when {
+                        probe.contains("DLOPEN_FAILED", ignoreCase = true) || exitCode == -102 ->
+                            LaunchErrorCategory.UNSUPPORTED_ARCHITECTURE
+                        exitCode == -105 || exitCode == -106 ->
+                            LaunchErrorCategory.MISSING_LIBRARIES
+                        else -> LaunchErrorCategory.FAILED_GAME_LAUNCH
+                    }
+                    ioScope.launch {
+                        container.crashHandler.recordCrash(
+                            installationId = plan.installationId,
+                            installationName = plan.installationName,
+                            minecraftVersion = plan.minecraftVersionId,
+                            exitCode = exitCode,
+                            rawLogs = synchronized(captured) { captured.toList() },
+                            overrideCategory = cat,
+                            explicitSummary = "Game JVM exited with code $exitCode. $probe",
+                        )
+                    }
+                    runOnUiThread {
+                        isBootingJvm = false
+                        errorTitle = cat.title
+                        errorMessage = "Game JVM exited with code $exitCode.\n$probe"
+                        recoveryHint = CrashHandler.defaultRecoveryFor(cat)
+                    }
+                } else {
+                    runOnUiThread { finishAndTerminateGameProcess() }
+                }
+            } catch (t: Throwable) {
+                logWriter?.println("[FATAL] ${t.stackTraceToString()}")
+                logWriter?.close()
+                runOnUiThread {
+                    isBootingJvm = false
+                    errorTitle = "JVM Launch Exception"
+                    errorMessage = t.message ?: "Unexpected native JVM error"
+                    recoveryHint = "Check Logs overlay and verify selected runtime."
+                }
+            }
+        }, "NoxerJvmMain").start()
+    }
+
+    private fun appendLog(line: String, isError: Boolean) {
+        if (isError) Log.e(TAG, line) else Log.i(TAG, line)
+        runOnUiThread {
+            if (liveLogLines.size >= 400) {
+                liveLogLines.removeAt(liveLogLines.lastIndex)
+            }
+            liveLogLines.add(0, line)
+        }
+    }
+
+    private fun handleSurfaceTouch(event: MotionEvent, inputManager: InputManager) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                touchDownX = event.x
+                touchDownY = event.y
+                lastTouchX = event.x
+                lastTouchY = event.y
+                touchDragged = false
+                NoxerNativeBridge.pushInputEvent(3, 0, 2, event.x, event.y)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = event.x - lastTouchX
+                val dy = event.y - lastTouchY
+                if (abs(event.x - touchDownX) > 10f || abs(event.y - touchDownY) > 10f) {
+                    touchDragged = true
+                }
+                lastTouchX = event.x
+                lastTouchY = event.y
+                // Send cursor coordinates + delta nicely
+                NoxerNativeBridge.pushInputEvent(3, 0, 2, event.x, event.y)
+                if (touchDragged && (dx != 0f || dy != 0f)) {
+                    inputManager.forwardMouseDelta(dx, dy, 1.0f, false)
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!touchDragged) {
+                    // Tap acts as left mouse click for menus / interaction
+                    NoxerNativeBridge.pushInputEvent(2, InputManager.GLFW_MOUSE_BUTTON_LEFT, 1, event.x, event.y)
+                    NoxerNativeBridge.pushInputEvent(2, InputManager.GLFW_MOUSE_BUTTON_LEFT, 0, event.x, event.y)
+                }
+            }
+        }
+    }
+
+    private fun finishAndTerminateGameProcess() {
+        finish()
+        // Kill only this isolated :game process so HotSpot JVM unloads completely for clean relaunch
+        android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -384,7 +597,7 @@ class GameViewportActivity : ComponentActivity() {
     }
 }
 
-@Composable
+@androidx.compose.runtime.Composable
 private fun TouchOverlayLayer(
     buttons: List<TouchButtonConfig>,
     editMode: Boolean,
@@ -424,11 +637,16 @@ private fun TouchOverlayLayer(
                                 onMoveButton(btn.id, nx, ny)
                             }
                         } else {
+                            var lastPressed = false
                             awaitPointerEventScope {
                                 while (true) {
                                     val event = awaitPointerEvent()
                                     val anyPressed = event.changes.any { it.pressed }
-                                    onPressChanged(btn, anyPressed)
+                                    if (anyPressed != lastPressed) {
+                                        lastPressed = anyPressed
+                                        onPressChanged(btn, anyPressed)
+                                    }
+                                    event.changes.forEach { it.consume() }
                                 }
                             }
                         }

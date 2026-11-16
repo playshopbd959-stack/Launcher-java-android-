@@ -61,7 +61,8 @@ object ArchiveExtractor {
         var extracted = false
         BufferedInputStream(FileInputStream(debFile)).use { raw ->
             ArArchiveInputStream(raw).use { ar ->
-                var entry = ar.nextEntry
+                @Suppress("DEPRECATION")
+                var entry = ar.nextArEntry
                 while (entry != null) {
                     val name = entry.name.trim()
                     if (name.startsWith("data.tar")) {
@@ -88,7 +89,8 @@ object ArchiveExtractor {
                         extracted = true
                         break
                     }
-                    entry = ar.nextEntry
+                    @Suppress("DEPRECATION")
+                    entry = ar.nextArEntry
                 }
             }
         }
@@ -108,10 +110,15 @@ object ArchiveExtractor {
         val execFiles = mutableListOf<File>()
 
         TarArchiveInputStream(input).use { tar ->
-            var entry: TarArchiveEntry? = tar.nextEntry
+            @Suppress("DEPRECATION")
+            var entry: TarArchiveEntry? = tar.nextTarEntry
             while (entry != null) {
                 val rawName = entry.name.trimStart('.', '/')
-                val relName = if (stripSingleRootDir && rawName.contains('/')) {
+                val firstSegment = rawName.substringBefore('/')
+                val shouldStripRoot = stripSingleRootDir &&
+                    rawName.contains('/') &&
+                    firstSegment !in STANDARD_TOP_DIRS
+                val relName = if (shouldStripRoot) {
                     rawName.substringAfter('/')
                 } else {
                     rawName
@@ -141,7 +148,8 @@ object ArchiveExtractor {
                         }
                     }
                 }
-                entry = tar.nextEntry
+                @Suppress("DEPRECATION")
+                entry = tar.nextTarEntry
             }
         }
 
@@ -177,7 +185,11 @@ object ArchiveExtractor {
             var entry = zip.nextEntry
             while (entry != null) {
                 val rawName = entry.name.trimStart('.', '/')
-                val relName = if (stripSingleRootDir && rawName.contains('/')) {
+                val firstSegment = rawName.substringBefore('/')
+                val shouldStripRoot = stripSingleRootDir &&
+                    rawName.contains('/') &&
+                    firstSegment !in STANDARD_TOP_DIRS
+                val relName = if (shouldStripRoot) {
                     rawName.substringAfter('/')
                 } else {
                     rawName
@@ -364,4 +376,8 @@ object ArchiveExtractor {
 
     private fun isSymlink(file: File): Boolean =
         runCatching { file.absolutePath != file.canonicalPath }.getOrDefault(false)
+
+    private val STANDARD_TOP_DIRS = setOf(
+        "bin", "lib", "jre", "conf", "include", "legal", "man", "data", "usr", "etc",
+    )
 }

@@ -45,6 +45,9 @@ object NoxerNativeBridge {
         if (nativeLoaded) nativeRenderHeartbeatFrame(pulse)
     }
 
+    fun isGameOwnsEgl(): Boolean =
+        if (nativeLoaded) nativeIsGameOwnsEgl() else false
+
     fun destroyWindow() {
         if (nativeLoaded) nativeDestroyWindow()
     }
@@ -87,6 +90,7 @@ object NoxerNativeBridge {
     private external fun nativeInitWindow(surface: Surface): Boolean
     private external fun nativeResizeWindow(width: Int, height: Int)
     private external fun nativeRenderHeartbeatFrame(pulse: Float)
+    private external fun nativeIsGameOwnsEgl(): Boolean
     private external fun nativeDestroyWindow()
     private external fun nativePushInputEvent(type: Int, code: Int, action: Int, x: Float, y: Float, modifiers: Int)
     private external fun nativeGetPendingInputCount(): Int
